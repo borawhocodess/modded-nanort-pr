@@ -1,0 +1,152 @@
+"""NanoRT baseline training script.
+
+This is the file competitors fork. Modify only:
+  1. The BFS heuristic parameters (max_bfs_width)
+  2. The transformer architecture (num_blocks, d_model, num_heads, d_ff,
+     and any changes to rt/model.py)
+  3. The optimizer (--optimizer muon, --muon-lr)
+
+Do NOT modify: val_tasks, val_eval_freq, time_budget_minutes, or the database
+lists. Those define the competition protocol.
+
+Run:
+    pixi run python scripts/nanort_train.py --holdout-db rel-avito
+    pixi run python scripts/nanort_train.py --holdout-db rel-avito --optimizer muon --muon-lr 5e-3
+"""
+
+import argparse
+import json
+import os
+
+from rt.main import main
+from rt.tasks import forecast_clf_tasks, autocomplete_clf_tasks
+
+HOME = os.environ["HOME"]
+PRE = os.path.join(HOME, "scratch", "pre")
+
+HOLDOUT_CANDIDATES = [
+    "rel-amazon",
+    "rel-hm",
+    "rel-stack",
+    "rel-avito",
+    "rel-trial",
+    "rel-f1",
+]
+
+ALL_CLF_TASKS = [
+    t for t in forecast_clf_tasks + autocomplete_clf_tasks if t[0] != "rel-event"
+]
+
+
+def clf_tasks_for_db(db_name: str):
+    return [t for t in ALL_CLF_TASKS if t[0] == db_name]
+
+
+def run(holdout_db: str, optimizer: str, muon_lr: float) -> None:
+    assert holdout_db in HOLDOUT_CANDIDATES, f"Unknown holdout: {holdout_db}"
+    assert optimizer in ("adamw", "muon"), f"Unknown optimizer: {optimizer}"
+
+    train_artifact_db = f"nanort-train-{holdout_db}"
+    train_artifact_path = os.path.join(PRE, train_artifact_db)
+    if not os.path.isdir(train_artifact_path):
+        raise FileNotFoundError(
+            f"Train artifact not found at {train_artifact_path}.\n"
+            f"Build it first: pixi run python scripts/build_artifact.py --holdout {holdout_db}"
+        )
+
+    train_tasks = [
+        (train_artifact_db, f"{db}/{table}", target, drop)
+        for db, table, target, drop in ALL_CLF_TASKS
+        if db != holdout_db
+    ]
+
+    val_artifact_db = f"nanort-val-{holdout_db}"
+    val_artifact_path = os.path.join(PRE, val_artifact_db)
+    if not os.path.isdir(val_artifact_path):
+        raise FileNotFoundError(
+            f"Val artifact not found at {val_artifact_path}.\n"
+            f"Build it first: pixi run python scripts/build_artifact.py --holdout {holdout_db}"
+        )
+
+    with open(os.path.join(val_artifact_path, "table_info.json")) as f:
+        val_table_info = json.load(f)
+
+    holdout_clf_tasks = clf_tasks_for_db(holdout_db)
+    val_tasks = [
+        (val_artifact_db, table, target, "Val", drop)
+        for _, table, target, drop in holdout_clf_tasks
+        if f"{table}:Val" in val_table_info
+    ]
+    if not val_tasks:
+        raise RuntimeError(f"No val tasks found in {val_artifact_path}/table_info.json")
+    print(f"Val tasks ({len(val_tasks)}): {[t[1] for t in val_tasks]}")
+
+    seed = int(os.environ.get("NANORT_SEED", "0"))
+    run_name_tag = f"{optimizer}"
+    if optimizer == "muon":
+        run_name_tag += f"-lr{muon_lr}"
+
+    main(
+        # misc
+        project=os.environ.get("WANDB_PROJECT", "modded-nanort"),
+        eval_splits=["val"],
+        eval_freq=None,
+        eval_pow2=False,
+        max_eval_steps=40,
+        load_ckpt_path=None,
+        save_ckpt_dir=f"ckpts/nanort-{holdout_db}-{run_name_tag}-s{seed}",
+        compile_=True,
+        seed=seed,
+        # data
+        train_tasks=train_tasks,
+        eval_tasks=[],
+        batch_size=int(os.environ.get("NANORT_BATCH_SIZE", "32")),
+        num_workers=8,
+        max_bfs_width=256,          # ← competitors may adjust
+        # optimization
+        lr=1e-3,
+        wd=0.1,
+        lr_schedule=True,
+        max_grad_norm=1.0,
+        max_steps=1_000_000,
+        # optimizer
+        optimizer=optimizer,
+        muon_lr=muon_lr,
+        muon_warmup_steps=200,
+        # model
+        embedding_model="all-MiniLM-L12-v2",
+        d_text=384,
+        seq_len=1024,
+        num_blocks=12,              # ← competitors may adjust
+        d_model=256,                # ← competitors may adjust
+        num_heads=8,                # ← competitors may adjust
+        d_ff=1024,                  # ← competitors may adjust
+        # NanoRT: competition hooks (do not modify)
+        val_tasks=val_tasks,
+        val_eval_freq=int(os.environ.get("NANORT_VAL_EVAL_FREQ", "500")),
+        time_budget_minutes=45,
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--holdout-db",
+        required=True,
+        choices=HOLDOUT_CANDIDATES,
+        help="The held-out database (fixed by competition organizers)",
+    )
+    parser.add_argument(
+        "--optimizer",
+        default="adamw",
+        choices=["adamw", "muon"],
+        help="Optimizer: 'adamw' (baseline) or 'muon'",
+    )
+    parser.add_argument(
+        "--muon-lr",
+        type=float,
+        default=5e-3,
+        help="Muon group learning rate (ignored when --optimizer adamw)",
+    )
+    args = parser.parse_args()
+    run(args.holdout_db, args.optimizer, args.muon_lr)
