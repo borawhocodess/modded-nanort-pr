@@ -1,191 +1,80 @@
-# Relational Transformer
+# modded-nanoRT
 
-This repository provides a reference implementation
-for the **ICLR 2026** paper: [Relational Transformer: Toward Zero-Shot Foundation Models for Relational Data](https://arxiv.org/abs/2510.06377).
+This repository hosts the *nanoRT speedrun*, in which we (collaboratively|competitively) search for the fastest way to use 1 NVIDIA H200 to train a Relational Transformer that beats the baseline on [`rel-avito`](https://relbench.stanford.edu/) from RelBench.
 
-**Exciting news!** Our follow-up work improves the pretraining and architecture for Relational Transformer. Please check out the [code](https://github.com/snap-stanford/plurel) for the paper [PluRel: Synthetic Data unlocks Scaling Laws for Relational Foundation Models](https://arxiv.org/abs/2602.04029).
+The code is derived from [snap-stanford/relational-transformer](https://github.com/snap-stanford/relational-transformer) with the inspiration of [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt).
+
+The current record beats the baseline in **12m 27s** with the following techniques:
+
+* Replaced AdamW with [Muon](https://github.com/KellerJordan/Muon) (`muon_lr=0.01`) for all matrix parameters, keeping AdamW for embeddings and biases.
+
+The following techniques were evaluated but did not lead to improvements:
+
+* (To be filled in as records land)
 
 
-## Record: Muon Optimizer
-
-Replacing AdamW with [Muon](https://github.com/KellerJordan/Muon) as the primary optimizer reduces time-to-target on `rel-avito` (zero-shot AUROC) from the baseline to **~12m 27s** on a single H200.
-
-| optimizer        | time to target | hardware  |
-| ---------------- | -------------- | --------- |
-| AdamW (baseline) | —              | 1× H200   |
-| **Muon**         | **12m 27s**    | 1× H200   |
-
-### Reproducing
+## Running the current record
 
 ```bash
-polyaxon run -f plx_nanort_train.yaml \
-  -P holdout_db=rel-avito \
-  -P hf_artifacts_repo=gabrielveloso/nanort-artifacts \
-  -P optimizer=muon \
-  -P muon_lr=0.01 \
-  -P batch_size=256 \
-  -p kunumi/Modded-RT \
-  --upload
-```
-
-Key changes vs. baseline (see `rt/model.py`, `rt/main.py`, `scripts/nanort_train.py`):
-
-- Optimizer: Muon (`muon_lr=0.01`) with AdamW for non-matrix params (`lr=1e-3`)
-- Muon warmup: 200 steps
-- Architecture unchanged: 12 blocks, `d_model=256`, 8 heads, `d_ff=1024`
-
-
-## Overview
-
-_🥇 Foundation Model Capabilities of Relational Transformer:_
-
-![Foundation Model Capabilities of Relational Transformer](assets/intro2.png "Foundation Model Capabilities of Relational Transformer")
-
-_🤖 Overview of the Relational Transformer Architecture:_
-
-![Overview of the Relational Transformer Architecture](assets/intro1.png "Overview of the Relational Transformer Architecture")
-
-
-## Installation
-
-1. Install pixi [https://pixi.sh/latest/#installation](https://pixi.sh/latest/#installation).
-
-2. Clone and install the repository:
-```bash
-git clone https://github.com/snap-stanford/relational-transformer
-cd relational-transformer
+git clone https://github.com/gabrielmveloso/Modded-NanoRT.git
+cd Modded-NanoRT
 pixi install
-# compile and install the rust sampler
-cd rustler
-pixi run maturin develop --uv --release
-```
+cd rustler && pixi run maturin develop --uv --release && cd ..
 
+pixi run hf download gabrielveloso/nanort-artifacts \
+    --repo-type dataset \
+    --include "holdout-rel-avito/*" \
+    --local-dir ~/scratch/nanort_artifacts
 
-## Data Preparation
-
-1. Download the datasets and tasks from Relbench:
-```bash
-cd .. # back to the root of the repository
-pixi run python scripts/download_relbench.py
-```
-
-2. Link the cache repository
-```bash
-mkdir ~/scratch
-ln -s ~/.cache/relbench ~/scratch/relbench
-```
-
-3. Preprocessing (per database):
-```bash
-cd rustler
-pixi run cargo run --release -- pre rel-f1
-```
-
-4. Text embedding (per database):
-
-```bash
-pixi run python -m rt.embed rel-f1
-```
-
-> [!NOTE]
-> Steps 3. and 4. should be run for all databases: \
-> `rel-amazon`, `rel-avito`, `rel-event`, `rel-f1`, `rel-hm`, `rel-stack`, `rel-trial`
-
-## Download Preprocessed Data
-This project’s preprocessed data is hosted at [hvag976/relational-transformer](https://huggingface.co/datasets/hvag976/relational-transformer/tree/main) on the Hugging Face Hub. You can directly use this data and skip the data preparation step.
-
-1. Install the CLI
-```bash
-pip install -U huggingface_hub
-```
-
-2. Create the destination
-```bash
 mkdir -p ~/scratch/pre
+ln -sf ~/scratch/nanort_artifacts/holdout-rel-avito/train ~/scratch/pre/nanort-train-rel-avito
+ln -sf ~/scratch/nanort_artifacts/holdout-rel-avito/val/rel-avito ~/scratch/pre/nanort-val-rel-avito
+
+./run.sh
 ```
 
-3. Download the repository contents into ~/scratch/pre
-```bash
-huggingface-cli download hvag976/relational-transformer \
-  --repo-type dataset \
-  --local-dir ~/scratch/pre \
-  --local-dir-use-symlinks False
-```  
-
-## Download Pretrained Checkpoints
-
-This project's pretrained model checkpoints are hosted at [rishabh-ranjan/relational-transformer](https://huggingface.co/rishabh-ranjan/relational-transformer/tree/main) on the Hugging Face Hub. You can directly use these checkpoints and skip the pretraining step.
-
-Two kinds of checkpoints are provided:
-- `pretrain_<dataset>_<task>.pt`: pretrained with `<dataset>` held out.
-- `contd-pretrain_<dataset>_<task>.pt`: obtained by continued pretraining of `pretrain_<dataset>_<task>.pt` on `<dataset>` with `<task>` held out.
-
-To use, pass the checkpoint path to the `load_ckpt_path` argument of the training scripts.
-
-1. Install the Hugging Face CLI (if not already installed):
-```bash
-pip install -U huggingface_hub
-```
-
-2. Download all checkpoints:
-```bash
-mkdir -p ~/scratch/rt_ckpts
-huggingface-cli download rishabh-ranjan/relational-transformer \
-  --repo-type model \
-  --local-dir ~/scratch/rt_ckpts \
-  --local-dir-use-symlinks False
-```
-
-3. Download a specific checkpoint:
-```bash
-mkdir -p ~/scratch/rt_ckpts
-huggingface-cli download rishabh-ranjan/relational-transformer \
-  --repo-type model \
-  --include "pretrain_rel-amazon_user-churn.pt" \
-  --local-dir ~/scratch/rt_ckpts \
-  --local-dir-use-symlinks False
-```
+Note: `torch.compile` of the flex-attention masks adds ~3 minutes on the first run. This is untimed.
 
 
-## Experiments
+## Record history
 
-First setup `wandb` with `pixi run wandb login` or `pixi run wandb disabled`. The following example commands replicate the results for `rel-amazon/user-churn` from the paper.
+The following is the historical progression of speed records for the following task:
 
-* Pretrain on all datasets with `rel-amazon` held-out
-(takes about 2 hours on 8xA100 GPUs):
-```bash
-pixi run torchrun --standalone --nproc_per_node=8 scripts/example_pretrain.py
-```
+> *Train a Relational Transformer to ≥0.81621 zero-shot AUROC on `rel-avito` using 1× NVIDIA H200, within 45 minutes of active training time.*
 
-* Continued pretrain
-from best checkpoint obtained above
-on all `rel-amazon` tasks
-with `user-churn` held-out
-(takes about 15 minutes on 8xA100 GPUs):
-```bash
-pixi run torchrun --standalone --nproc_per_node=8 scripts/example_contd_pretrain.py
-```
+The 0.81621 target was selected to match the baseline calibration run over the upstream [snap-stanford/relational-transformer](https://github.com/snap-stanford/relational-transformer) code.
 
-* Finetune
-from best checkpoint obtained above
-on `rel-amazon/user-churn` task only
-(takes about 1.5 hours on 8xA100 GPUs):
-```bash
-pixi run torchrun --standalone --nproc_per_node=8 scripts/example_finetune.py
-```
+| #  | Record            | Date       | Description              | Links                      | Contributors     |
+| -- | ----------------- | ---------- | ------------------------ | -------------------------- | ---------------- |
+| 1  | 0.81621 AUROC @ 45 min | TBD   | Baseline                 | [log](records/01_baseline) |                  |
+| 2  | **12m 27s**       | 2026-05-05 | Muon optimizer (`lr=0.01`) | [log](records/02_muon)   | Gabriel Veloso   |
 
 
+## Rules
 
-## Citation
+New records must:
+* Not modify the val artifact (seeds, embeddings, 3-hop extraction radius).
+* Not modify the training mix (same 5 databases, same α=0.3 mixing, no `rel-avito`).
+* Not use `rel-avito` data in any form during training.
+* Attain ≥0.81621 mean val AUROC at the 45-minute mark (p<0.01 over multiple seeds).
+* Run on 1× H200, with active training time measured by `rt/main.py`'s `TrainTimer`.
 
-Please cite our paper as:
+Other than that, anything and everything is fair game!
 
-```bibtex
-@inproceedings{ranjan2025relationaltransformer,
-    title={{Relational Transformer:} Toward Zero-Shot Foundation Models for Relational Data}, 
-    author={Rishabh Ranjan and Valter Hudovernik and Mark Znidar and Charilaos Kanatsoulis and Roshan Upendra and Mahmoud Mohammadi and Joe Meyer and Tom Palczewski and Carlos Guestrin and Jure Leskovec},
-    booktitle={The Fourteenth International Conference on Learning Representations},
-    year={2026}
-}
-```
 
+## Evaluation details
+
+Evaluation is zero-shot AUROC on the `rel-avito` validation seeds.
+
+* Val set: `rel-avito` mini-database, seeds from `Val` split, capped at 50 000 seeds, extracted at `max_hops=3`.
+* Seeds, hops, and embeddings are frozen for all submissions.
+* Metric: mean AUROC across `rel-avito` binary-classification tasks, averaged over the val seeds.
+
+
+## References
+
+1. [Robinson et al. RelBench: A Benchmark for Deep Learning on Relational Databases. NeurIPS 2024.](https://arxiv.org/abs/2407.20060)
+2. [Ranjan et al. Relational Transformer. snap-stanford, 2024.](https://github.com/snap-stanford/relational-transformer)
+3. [Reimers & Gurevych. Sentence-BERT. EMNLP 2019.](https://arxiv.org/abs/1908.10084)
+4. [Jordan et al. modded-nanogpt. 2024–2026.](https://github.com/KellerJordan/modded-nanogpt)
+5. [Müller et al. modded-nanotabpfn. 2026.](https://github.com/borawhocodess/modded-nanotabpfn)
