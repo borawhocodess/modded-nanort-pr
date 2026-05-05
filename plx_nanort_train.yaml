@@ -1,0 +1,112 @@
+version: 1.1
+kind: component
+name: nanort-train
+description: >
+  NanoRT training run com Muon optimizer: pretrain RT for 45 minutes on 1xH200,
+  leaving one database held out, and log zero-shot AUROC on the fixed val artifact.
+queue: nebius/default
+inputs:
+  - name: holdout_db
+    description: >
+      Held-out RelBench database. Training uses all other databases; zero-shot
+      AUROC is evaluated on this database's val artifact.
+    type: str
+    isOptional: false
+  - name: hf_artifacts_repo
+    description: >
+      HuggingFace dataset repo containing the NanoRT artifacts
+      (produced by plx_nanort_build_upload.yaml).
+      Example: "franciscogaluppo/nanort-artifacts"
+    type: str
+    isOptional: false
+  - name: wandb_project
+    description: W&B project name.
+    type: str
+    isOptional: true
+    value: nanort-train
+  - name: seed
+    description: Random seed (run multiple seeds for std_across_seeds in select_holdout.py).
+    type: int
+    isOptional: true
+    value: 0
+  - name: val_eval_freq
+    description: Log val/auroc_zero_shot every N training steps.
+    type: int
+    isOptional: true
+    value: 500
+  - name: batch_size
+    description: Training batch size. Increase to improve GPU utilization.
+    type: int
+    isOptional: true
+    value: 256
+  - name: optimizer
+    description: Optimizer to use — "adamw" (baseline) or "muon".
+    type: str
+    isOptional: true
+    value: muon
+  - name: muon_lr
+    description: Muon group learning rate (ignored when optimizer=adamw).
+    type: float
+    isOptional: true
+    value: 0.005
+  - name: hf_token
+    description: HuggingFace token for higher rate limits on artifact download.
+    type: str
+    isOptional: true
+    value: ""
+cache:
+  disable: true
+termination:
+  maxRetries: 0
+run:
+  kind: job
+  connections: [wandb-connection]
+  environment:
+    nodeSelector:
+      polyaxon: h200
+  container:
+    resources:
+      limits:
+        nvidia.com/gpu: "1"
+    command:
+      - bash
+      - "-c"
+      - |
+        exec > >(tee {{ globals.run_outputs_path }}/log.txt) 2>&1
+        set -eu
+        apt-get update && apt-get install -y curl
+        curl -fsSL https://pixi.sh/install.sh | sh
+        export PATH="$HOME/.pixi/bin:$PATH"
+        cd {{ globals.run_artifacts_path }}/uploads
+        pixi install
+        cd rustler && pixi run maturin develop --uv --release && cd ..
+        mkdir -p ~/scratch/pre
+        pip3 install --root-user-action ignore polyaxon huggingface_hub hf_transfer
+        export WANDB_USER_EMAIL="{{ globals.user_email }}"
+        hf download {{ hf_artifacts_repo }} --repo-type dataset --include "holdout-{{ holdout_db }}/train/*" --local-dir ~/scratch/nanort_artifacts
+        ln -sf ~/scratch/nanort_artifacts/holdout-{{ holdout_db }}/train ~/scratch/pre/nanort-train-{{ holdout_db }}
+        hf download {{ hf_artifacts_repo }} --repo-type dataset --include "holdout-{{ holdout_db }}/val/*" --local-dir ~/scratch/nanort_artifacts
+        ln -sf ~/scratch/nanort_artifacts/holdout-{{ holdout_db }}/val/{{ holdout_db }} ~/scratch/pre/nanort-val-{{ holdout_db }}
+        pixi run python scripts/nanort_train.py --holdout-db {{ holdout_db }} --optimizer {{ optimizer }} --muon-lr {{ muon_lr }}
+    image: "pytorch/pytorch:2.5.0-cuda12.4-cudnn9-devel"
+    name: polyaxon-main
+    workingDir: "{{ globals.run_artifacts_path }}/uploads"
+    env:
+      - name: WANDB_PROJECT
+        value: "{{ wandb_project }}"
+      - name: WANDB_TAGS
+        value: "nanort-train,{{ holdout_db }}"
+      - name: WANDB_RUN_GROUP
+        value: "nanort-train"
+      - name: TEAM_WANDB
+        value: franciscokunumi-universidade-federal-de-minas-gerais
+      - name: HF_HUB_ENABLE_HF_TRANSFER
+        value: "1"
+      - name: HF_TOKEN
+        value: "{{ hf_token }}"
+      - name: NANORT_SEED
+        value: "{{ seed }}"
+      - name: NANORT_VAL_EVAL_FREQ
+        value: "{{ val_eval_freq }}"
+      - name: NANORT_BATCH_SIZE
+        value: "{{ batch_size }}"

@@ -51,8 +51,9 @@ class Muon(torch.optim.Optimizer):
         momentum: float = 0.95,
         nesterov: bool = True,
         ns_steps: int = 5,
+        weight_decay: float = 0.0,
     ):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -82,16 +83,15 @@ class Muon(torch.optim.Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(g)
 
                 buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-
-                if nesterov:
-                    g = g.add(buf, alpha=momentum)
-                else:
-                    g = buf
+                buf.lerp_(g, 1 - momentum)
+                g = g.lerp_(buf, momentum) if nesterov else buf
 
                 g = _zeropower_via_newtonschulz5(g, steps=ns_steps)
                 # Scale update so RMS matches 1/lr (same convention as AdamW).
-                g = g * max(1, g.size(0) / g.size(1)) ** 0.5
+                g = g * max(1, g.size(-2) / g.size(-1)) ** 0.5
+                wd = group["weight_decay"]
+                if wd > 0:
+                    p.mul_(1 - lr * wd)
                 p.add_(g.to(p.dtype), alpha=-lr)
 
         return loss

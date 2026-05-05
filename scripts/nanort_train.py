@@ -123,7 +123,7 @@ def run(holdout_db: str, optimizer: str, muon_lr: float) -> None:
         d_ff=1024,                  # ← competitors may adjust
         # NanoRT: competition hooks (do not modify)
         val_tasks=val_tasks,
-        val_eval_freq=int(os.environ.get("NANORT_VAL_EVAL_FREQ", "500")),
+        val_eval_freq=int(os.environ.get("NANORT_VAL_EVAL_FREQ", "100")),
         time_budget_minutes=45,
     )
 

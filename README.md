@@ -6,6 +6,35 @@ for the **ICLR 2026** paper: [Relational Transformer: Toward Zero-Shot Foundatio
 **Exciting news!** Our follow-up work improves the pretraining and architecture for Relational Transformer. Please check out the [code](https://github.com/snap-stanford/plurel) for the paper [PluRel: Synthetic Data unlocks Scaling Laws for Relational Foundation Models](https://arxiv.org/abs/2602.04029).
 
 
+## Record: Muon Optimizer
+
+Replacing AdamW with [Muon](https://github.com/KellerJordan/Muon) as the primary optimizer reduces time-to-target on `rel-avito` (zero-shot AUROC) from the baseline to **~12m 27s** on a single H200.
+
+| optimizer        | time to target | hardware  |
+| ---------------- | -------------- | --------- |
+| AdamW (baseline) | —              | 1× H200   |
+| **Muon**         | **12m 27s**    | 1× H200   |
+
+### Reproducing
+
+```bash
+polyaxon run -f plx_nanort_train.yaml \
+  -P holdout_db=rel-avito \
+  -P hf_artifacts_repo=gabrielveloso/nanort-artifacts \
+  -P optimizer=muon \
+  -P muon_lr=0.01 \
+  -P batch_size=256 \
+  -p kunumi/Modded-RT \
+  --upload
+```
+
+Key changes vs. baseline (see `rt/model.py`, `rt/main.py`, `scripts/nanort_train.py`):
+
+- Optimizer: Muon (`muon_lr=0.01`) with AdamW for non-matrix params (`lr=1e-3`)
+- Muon warmup: 200 steps
+- Architecture unchanged: 12 blocks, `d_model=256`, 8 heads, `d_ff=1024`
+
+
 ## Overview
 
 _🥇 Foundation Model Capabilities of Relational Transformer:_
