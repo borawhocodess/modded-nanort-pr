@@ -269,6 +269,7 @@ def main(
     sigreg_knots: int = 17,
     sigreg_t_max: float = 3.0,
     sigreg_min_group: int = 8,
+    sigreg_col_global_pool: bool = True,
     # NanoRT: zero-shot AUROC evaluation on fixed val artifact
     val_tasks=None,
     val_eval_freq=None,
@@ -390,6 +391,7 @@ def main(
         sigreg_knots=sigreg_knots,
         sigreg_t_max=sigreg_t_max,
         sigreg_min_group=sigreg_min_group,
+        sigreg_col_global_pool=sigreg_col_global_pool,
         sigreg_use_row=sigreg_lambda_row > 0.0,
         sigreg_use_col=sigreg_lambda_col > 0.0,
     )

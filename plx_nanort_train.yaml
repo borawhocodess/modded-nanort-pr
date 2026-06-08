@@ -76,6 +76,14 @@ inputs:
     type: int
     isOptional: true
     value: 8
+  - name: sigreg_col_pool
+    description: >
+      Column-view grouping. 1 = pool each (table, col) feature globally across
+      the batch (recommended; large uniform groups). 0 = per-sequence groups
+      (legacy).
+    type: int
+    isOptional: true
+    value: 1
   - name: hf_token
     description: HuggingFace token for higher rate limits on artifact download.
     type: str
@@ -114,7 +122,7 @@ run:
         ln -sf ~/scratch/nanort_artifacts/holdout-{{ holdout_db }}/train ~/scratch/pre/nanort-train-{{ holdout_db }}
         hf download {{ hf_artifacts_repo }} --repo-type dataset --include "holdout-{{ holdout_db }}/val/*" --local-dir ~/scratch/nanort_artifacts
         ln -sf ~/scratch/nanort_artifacts/holdout-{{ holdout_db }}/val/{{ holdout_db }} ~/scratch/pre/nanort-val-{{ holdout_db }}
-        pixi run python scripts/nanort_train.py --holdout-db {{ holdout_db }} --optimizer {{ optimizer }} --muon-lr {{ muon_lr }} --sigreg-layer {{ sigreg_layer }} --sigreg-lambda-row {{ sigreg_lambda_row }} --sigreg-lambda-col {{ sigreg_lambda_col }} --sigreg-n-proj {{ sigreg_n_proj }} --sigreg-min-group {{ sigreg_min_group }}
+        pixi run python scripts/nanort_train.py --holdout-db {{ holdout_db }} --optimizer {{ optimizer }} --muon-lr {{ muon_lr }} --sigreg-layer {{ sigreg_layer }} --sigreg-lambda-row {{ sigreg_lambda_row }} --sigreg-lambda-col {{ sigreg_lambda_col }} --sigreg-n-proj {{ sigreg_n_proj }} --sigreg-min-group {{ sigreg_min_group }} --sigreg-col-pool {{ sigreg_col_pool }}
     image: "pytorch/pytorch:2.5.0-cuda12.4-cudnn9-devel"
     name: polyaxon-main
     workingDir: "{{ globals.run_artifacts_path }}/uploads"

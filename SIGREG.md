@@ -58,7 +58,10 @@ uma população de embeddings `Z ∈ R^{N×D}`:
    integrando dispensa o lado negativo). **Não há padronização separada** dos
    dados: o próprio teste empurra a distribuição para `N(0,1)` (média 0, var 1).
 
-4. A perda é a média sobre as K projeções e sobre os grupos.
+4. Por grupo: média sobre as K projeções. Entre grupos: **média ponderada por
+   N_g** (a estatística de cada grupo é escalada por seu N_g e a soma é dividida
+   pelo total de células válidas, não pelo número de grupos). Isso torna a perda
+   **invariante à escala do agrupamento** — ver §3 sobre o pooling do col view.
 
 Quanto **menor** o valor, mais gaussiana/isotrópica está a representação
 projetada.
@@ -77,13 +80,28 @@ projetada.
 - **`_dense_group_ids`** — relabela os ids de grupo (node, ou `(table,col)`
   empacotado) para `[0, S)` por linha, via sort+cumsum+scatter (shapes fixos →
   compatível com `torch.compile`).
+- **`_dense_group_ids_global`** — relabela os ids de `(table,col)` para
+  `[0, B·S)` sobre **todo o batch** (sort+cumsum+scatter, shapes fixos →
+  compatível com `torch.compile`), juntando a mesma feature de todas as
+  sequências num **grupo único**. Usado pelo col view quando
+  `col_global_pool=True` (default).
 - **`_grouped_epps_pulley`** — estatística sketched Epps–Pulley **por grupo**,
-  usando `index_add_` num índice 1-D achatado `[0, B·G)` (evita índices
-  gigantes). Células de padding contribuem **zero** para somas e contagens (não
-  poluem grupos mesmo em colisão de chave). Grupos com menos de `min_group`
-  células válidas são ignorados; o default atual é 8 para evitar estatísticas de
-  normalidade sobre grupos quase vazios. Cada grupo é escalado por seu N e a
-  perda é a média sobre os grupos válidos.
+  usando `index_add_` num índice 1-D achatado pré-computado pelo chamador
+  (`row_flat`/`col_flat`). Células de padding contribuem **zero** para somas e
+  contagens (não poluem grupos mesmo em colisão de chave). Grupos com menos de
+  `min_group` células válidas são ignorados (default 8). Cada grupo é escalado
+  por seu N_g e a perda é a **média ponderada por N_g** (soma das estatísticas
+  ÷ total de células válidas, não ÷ nº de grupos) — assim a magnitude **não
+  depende do tamanho/quantidade de grupos nem do `batch_size`**, e `λ` fica
+  comparável entre col pooled/per-sequence e entre row/col.
+- **Pooling do col view** (`col_global_pool`): no paper o column-group são
+  **todas** as R linhas de uma feature numa população só. No nanoRT relacional,
+  agrupar por sequência dava ~B grupinhos de ~65 células (e descartava ~23% por
+  `min_group`). Com pooling global, cada `(table,col)` vira **um** grupo grande e
+  uniforme (≈ N·B células) — estimador da função característica muito mais
+  estável, que é o que reproduz a redução de variância entre seeds do paper. O
+  row view continua por `(sequência, node)` (nós são locais à sequência, não dá
+  para juntar entre BFS distintos).
 - **`SIGReg`** — orquestra as duas views; amostra direções frescas a cada passo;
   tudo em **fp32**.
 
@@ -240,3 +258,4 @@ Para comparação estatística entre seeds (como no paper), rode múltiplos seed
 | `sigreg_knots` | `17` | Nós da quadratura Epps–Pulley. |
 | `sigreg_t_max` | `3.0` | Limite de integração `t`. |
 | `sigreg_min_group` | `8` | Mín. de células válidas por grupo para entrar na média. |
+| `sigreg_col_global_pool` (`--sigreg-col-pool`) | `True` (`1`) | Col view: `1` junta cada feature `(table,col)` num grupo global no batch (recomendado); `0` = grupos por sequência (legacy). |

@@ -120,6 +120,7 @@ class RelationalTransformer(nn.Module):
         sigreg_knots=17,
         sigreg_t_max=3.0,
         sigreg_min_group=8,
+        sigreg_col_global_pool=True,
         sigreg_use_row=True,
         sigreg_use_col=True,
     ):
@@ -180,6 +181,7 @@ class RelationalTransformer(nn.Module):
                 knots=sigreg_knots,
                 t_max=sigreg_t_max,
                 min_group=sigreg_min_group,
+                col_global_pool=sigreg_col_global_pool,
             )
         else:
             self.sigreg = None

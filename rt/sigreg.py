@@ -119,9 +119,30 @@ def _dense_group_ids(keys: torch.Tensor) -> torch.Tensor:
     return gid
 
 
+def _dense_group_ids_global(keys: torch.Tensor) -> torch.Tensor:
+    """Global dense relabelling across the whole ``(B, S)`` batch into ``[0, B*S)``.
+
+    Like ``_dense_group_ids`` but pools cells with the same key across *all* rows
+    of the batch into a single group, instead of one group per ``(row, key)``.
+    Used by the column view so each ``(table, col)`` feature forms one large,
+    uniform population (mirroring the paper's clean-grid column groups) rather
+    than ~B small per-sequence groups. Fully vectorised (sort + cumsum + scatter)
+    so it is torch.compile-friendly with static shapes (sort is over ``B*S``).
+    """
+    flat = keys.reshape(-1)
+    sorted_keys, sort_idx = flat.sort()
+    is_new = torch.ones_like(sorted_keys, dtype=torch.bool)
+    is_new[1:] = sorted_keys[1:] != sorted_keys[:-1]
+    dense_sorted = is_new.to(torch.int64).cumsum(0) - 1
+    gid = torch.empty_like(flat, dtype=torch.int64)
+    gid.scatter_(0, sort_idx, dense_sorted)
+    return gid
+
+
 def _grouped_epps_pulley(
     z: torch.Tensor,        # (B, S, D) fp32 projected embeddings
-    gid: torch.Tensor,      # (B, S) int64 dense group ids in [0, S)
+    flat_idx: torch.Tensor, # (B*S,) int64 group slot of each cell in [0, n_slots)
+    n_slots: int,           # static size of the group buffer (= B*S)
     valid: torch.Tensor,    # (B, S) bool valid (non-padding) cells
     dirs: torch.Tensor,     # (D, K) fp32 unit-norm projection directions
     t: torch.Tensor,        # (T,) fp32 quadrature nodes
@@ -129,15 +150,25 @@ def _grouped_epps_pulley(
     weights: torch.Tensor,  # (T,) fp32 trapezoidal weights × window
     min_group: float,       # groups with fewer valid cells are ignored
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Sketched Epps–Pulley statistic evaluated per group, averaged over groups.
+    """Sketched Epps–Pulley statistic evaluated per group, pooled over groups.
 
-    Padding cells contribute zero to both the per-group sums and counts (so they
-    cannot pollute a group even if a key collision puts them in a real group).
+    ``flat_idx`` maps each of the B·S cells to a group slot in ``[0, n_slots)``;
+    the caller chooses the grouping — per-``(row, node)`` for the row view, or
+    pooled globally per ``(table, col)`` across the whole batch for the column
+    view. Padding cells contribute zero to both the per-group sums and counts (so
+    they cannot pollute a group even if a key collision puts them in a real one).
+
+    The per-group Epps–Pulley statistic is scaled by the group size ``N_g`` (as
+    in LeJEPA), then aggregated as an ``N_g``-weighted mean of the per-group,
+    per-slice deviation — i.e. divided by the total valid cells, not the group
+    count. This makes the loss **scale-invariant to the grouping**: pooling a
+    feature across the batch (≈ N_g·B larger groups) no longer inflates the loss
+    magnitude by ~B, so ``λ`` stays comparable across pooled/per-sequence groups
+    and batch sizes.
     """
     B, S, D = z.shape
     K = dirs.shape[1]
     T = t.shape[0]
-    G = S            # at most S distinct groups per row
     F_ = K * T
 
     vmask = valid.to(z.dtype)                            # (B, S)
@@ -147,37 +178,34 @@ def _grouped_epps_pulley(
     cos = (torch.cos(x_t) * w_cells).reshape(B * S, F_)
     sin = (torch.sin(x_t) * w_cells).reshape(B * S, F_)
 
-    # Flatten (b, group) → a single [0, B*G) index so each batch row keeps its
-    # own groups; index_add_ then needs only a small 1-D index (no expand).
-    base = (torch.arange(B, device=z.device, dtype=torch.int64) * G).unsqueeze(1)
-    flat_idx = (base + gid).reshape(B * S)               # (B*S,)
-
-    sum_cos = torch.zeros(B * G, F_, dtype=z.dtype, device=z.device).index_add_(
+    sum_cos = torch.zeros(n_slots, F_, dtype=z.dtype, device=z.device).index_add_(
         0, flat_idx, cos
     )
-    sum_sin = torch.zeros(B * G, F_, dtype=z.dtype, device=z.device).index_add_(
+    sum_sin = torch.zeros(n_slots, F_, dtype=z.dtype, device=z.device).index_add_(
         0, flat_idx, sin
     )
-    cnt = torch.zeros(B * G, dtype=z.dtype, device=z.device).index_add_(
+    cnt = torch.zeros(n_slots, dtype=z.dtype, device=z.device).index_add_(
         0, flat_idx, vmask.reshape(B * S)
-    )                                                    # (B*G,) valid count/group
+    )                                                    # (n_slots,) valid count/group
 
-    denom = cnt.clamp(min=1.0).unsqueeze(-1)             # (B*G, 1)
-    cos_mean = (sum_cos / denom).reshape(B * G, K, T)
-    sin_mean = (sum_sin / denom).reshape(B * G, K, T)
-    err = (cos_mean - phi) ** 2 + sin_mean ** 2          # (B*G, K, T)
-    stat = (err @ weights) * cnt.unsqueeze(-1)           # (B*G, K) — scaled by N_g
-    stat = stat.mean(dim=-1)                             # (B*G,) mean over slices
+    denom = cnt.clamp(min=1.0).unsqueeze(-1)             # (n_slots, 1)
+    cos_mean = (sum_cos / denom).reshape(n_slots, K, T)
+    sin_mean = (sum_sin / denom).reshape(n_slots, K, T)
+    err = (cos_mean - phi) ** 2 + sin_mean ** 2          # (n_slots, K, T)
+    stat = (err @ weights) * cnt.unsqueeze(-1)           # (n_slots, K) — scaled by N_g
+    stat = stat.mean(dim=-1)                             # (n_slots,) mean over slices
 
     group_present = (cnt > 0).to(z.dtype)
-    group_ok = (cnt >= min_group).to(z.dtype)            # (B*G,)
+    group_ok = (cnt >= min_group).to(z.dtype)            # (n_slots,)
     num_present = group_present.sum()
     num_groups = group_ok.sum()
     num_groups_safe = num_groups.clamp(min=1.0)
     valid_cells = (cnt * group_ok).sum()
+    valid_cells_safe = valid_cells.clamp(min=1.0)
     total_cells = cnt.sum().clamp(min=1.0)
 
-    loss = (stat * group_ok).sum() / num_groups_safe
+    # N_g-weighted mean of the per-group statistic (scale-invariant to grouping).
+    loss = (stat * group_ok).sum() / valid_cells_safe
     stats = {
         "groups_present": num_present,
         "groups_valid": num_groups,
@@ -220,6 +248,7 @@ class SIGReg(nn.Module):
         knots: int = 17,
         t_max: float = 3.0,
         min_group: int = 8,
+        col_global_pool: bool = True,
     ):
         super().__init__()
         self.row_proj = Projector(
@@ -230,6 +259,9 @@ class SIGReg(nn.Module):
         )
         self.n_proj = n_proj
         self.min_group = float(min_group)
+        # Column view: pool each (table, col) feature across the whole batch into
+        # one large population (recommended), vs. one group per sequence (legacy).
+        self.col_global_pool = col_global_pool
 
         t = torch.linspace(0.0, t_max, knots, dtype=torch.float32)
         dt = t_max / (knots - 1)
@@ -257,15 +289,23 @@ class SIGReg(nn.Module):
     ):
         x = x.float()
         valid = ~is_padding
+        B, S = node_idxs.shape
+        n_slots = B * S
         zero = torch.zeros((), device=x.device, dtype=torch.float32)
         stats: dict[str, torch.Tensor] = {}
 
-        # row view: group cells by datapoint (node)
+        # row view: group cells by datapoint (node), independently per sequence.
+        # Nodes are sequence-local, so the row view always pools per (row, node).
         if use_row:
-            row_gid = _dense_group_ids(node_idxs.to(torch.int64))
+            row_gid = _dense_group_ids(node_idxs.to(torch.int64))   # (B, S) in [0, S)
+            row_base = (
+                torch.arange(B, device=x.device, dtype=torch.int64) * S
+            ).unsqueeze(1)
+            row_flat = (row_base + row_gid).reshape(n_slots)
             z_row = self.row_proj(x, valid)
             row_loss, row_stats = _grouped_epps_pulley(
-                z_row, row_gid, valid, self._sample_dirs(z_row.shape[-1], x.device),
+                z_row, row_flat, n_slots, valid,
+                self._sample_dirs(z_row.shape[-1], x.device),
                 self.t, self.phi, self.weights, self.min_group,
             )
         else:
@@ -274,16 +314,27 @@ class SIGReg(nn.Module):
         for key, value in row_stats.items():
             stats[f"row/{key}"] = value
 
-        # column view: group cells by feature = (table, column)
+        # column view: group cells by feature = (table, column). With
+        # col_global_pool, the same feature is pooled across the *whole* batch
+        # into one large, uniform population (mirroring the paper's clean-grid
+        # column groups); otherwise it falls back to per-sequence grouping.
         if use_col:
             col_keys = (
                 table_name_idxs.to(torch.int64) * self.COL_STRIDE
                 + col_name_idxs.to(torch.int64)
             )
-            col_gid = _dense_group_ids(col_keys)
+            if self.col_global_pool:
+                col_flat = _dense_group_ids_global(col_keys)        # (B*S,) in [0, B*S)
+            else:
+                col_gid = _dense_group_ids(col_keys)
+                col_base = (
+                    torch.arange(B, device=x.device, dtype=torch.int64) * S
+                ).unsqueeze(1)
+                col_flat = (col_base + col_gid).reshape(n_slots)
             z_col = self.col_proj(x, valid)
             col_loss, col_stats = _grouped_epps_pulley(
-                z_col, col_gid, valid, self._sample_dirs(z_col.shape[-1], x.device),
+                z_col, col_flat, n_slots, valid,
+                self._sample_dirs(z_col.shape[-1], x.device),
                 self.t, self.phi, self.weights, self.min_group,
             )
         else:

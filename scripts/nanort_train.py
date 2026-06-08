@@ -57,6 +57,7 @@ def run(
     sigreg_n_proj: int = 64,
     sigreg_lr: float | None = None,
     sigreg_min_group: int = 8,
+    sigreg_col_global_pool: bool = True,
 ) -> None:
     assert holdout_db in HOLDOUT_CANDIDATES, f"Unknown holdout: {holdout_db}"
     assert optimizer in ("adamw", "muon"), f"Unknown optimizer: {optimizer}"
@@ -150,6 +151,7 @@ def run(
         sigreg_n_proj=sigreg_n_proj,
         sigreg_lr=sigreg_lr,
         sigreg_min_group=sigreg_min_group,
+        sigreg_col_global_pool=sigreg_col_global_pool,
         # NanoRT: competition hooks (do not modify)
         val_tasks=val_tasks,
         val_eval_freq=int(os.environ.get("NANORT_VAL_EVAL_FREQ", "100")),
@@ -214,6 +216,15 @@ if __name__ == "__main__":
         default=8,
         help="Minimum valid cells per row/column group used by SIGReg",
     )
+    parser.add_argument(
+        "--sigreg-col-pool",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Column-view grouping: 1 = pool each (table, col) feature globally "
+        "across the batch (recommended; large uniform groups), 0 = per-sequence "
+        "groups (legacy).",
+    )
     args = parser.parse_args()
     run(
         args.holdout_db,
@@ -225,4 +236,5 @@ if __name__ == "__main__":
         sigreg_n_proj=args.sigreg_n_proj,
         sigreg_lr=args.sigreg_lr,
         sigreg_min_group=args.sigreg_min_group,
+        sigreg_col_global_pool=bool(args.sigreg_col_pool),
     )
