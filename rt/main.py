@@ -90,7 +90,7 @@ class ValAUROCCallback:
         self._time_to_target: float | None = None  # seconds; set once
 
     def step(self, step: int, net: torch.nn.Module) -> None:
-        if step % self.eval_every != 0:
+        if step != 1 and step % self.eval_every != 0:
             return
 
         net.eval()
@@ -104,7 +104,7 @@ class ValAUROCCallback:
                 batch["is_targets"][true_batch_size:, :] = False
                 batch["is_padding"][true_batch_size:, :] = True
 
-                loss, yhat_dict = net(batch)
+                loss, yhat_dict, _ = net(batch)
                 yhat = yhat_dict["boolean"][batch["is_targets"]]
                 y = batch["boolean_values"][batch["is_targets"]].flatten()
 
@@ -157,6 +157,35 @@ def seed_everything(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+@torch.no_grad()
+def geometry_diagnostics(embed: torch.Tensor, is_padding: torch.Tensor):
+    """Backbone geometry metrics at the SIGReg-regularized layer.
+
+    Computed eager (outside torch.compile) over the valid (non-padding) cell
+    embeddings of one training batch.
+
+      * effective_rank — exp(Shannon entropy of the normalized covariance
+        eigenvalues). High = embeddings spread across many dimensions
+        (isotropic); low = collapsed onto a few directions. This is the paper's
+        headline geometry metric (Fig. 1/6): SIGReg should push it *up*.
+      * mean_dim_std — mean per-dimension standard deviation. Higher = the
+        representation uses more of the embedding space; SIGReg pushes it *up*.
+    """
+    x = embed.float()
+    valid = (~is_padding)[..., None].float()           # (B, S, 1)
+    n = valid.sum().clamp(min=1.0)
+    mean = (x * valid).sum(dim=(0, 1)) / n             # (E,)
+    xc = (x - mean) * valid                            # centered, padding zeroed
+    E = x.shape[-1]
+    var = (xc ** 2).sum(dim=(0, 1)) / n                # (E,)
+    mean_dim_std = var.clamp(min=0.0).sqrt().mean().item()
+    cov = (xc.reshape(-1, E).T @ xc.reshape(-1, E)) / n  # (E, E)
+    eig = torch.linalg.eigvalsh(cov).clamp(min=1e-12)
+    p = eig / eig.sum()
+    effective_rank = torch.exp(-(p * p.log()).sum()).item()
+    return effective_rank, mean_dim_std
 
 
 def all_gather_nd(tensor: torch.Tensor) -> list[torch.Tensor]:
@@ -228,12 +257,31 @@ def main(
     d_model=256,
     num_heads=8,
     d_ff=1024,
+    # SIGReg: early-layer geometry regularization (sigreg_layer=None disables it)
+    sigreg_layer=None,
+    sigreg_lambda_row: float = 0.0,
+    sigreg_lambda_col: float = 0.0,
+    sigreg_lr: float | None = None,   # projector LR (defaults to `lr`)
+    sigreg_n_proj: int = 64,
+    sigreg_proj_hidden_mult: int = 4,
+    sigreg_proj_out_div: int = 4,
+    sigreg_proj_hidden_layers: int = 1,
+    sigreg_knots: int = 17,
+    sigreg_t_max: float = 3.0,
+    sigreg_min_group: int = 8,
     # NanoRT: zero-shot AUROC evaluation on fixed val artifact
     val_tasks=None,
     val_eval_freq=None,
     # NanoRT: 45-minute wall-clock budget
     time_budget_minutes=None,
 ):
+    if sigreg_layer is not None and sigreg_layer < 0:
+        sigreg_layer = None
+    if sigreg_lambda_row < 0.0 or sigreg_lambda_col < 0.0:
+        raise ValueError("SIGReg lambdas must be non-negative")
+    if sigreg_lambda_row + sigreg_lambda_col >= 1.0:
+        raise ValueError("SIGReg lambdas must sum to less than 1.0")
+
     seed_everything(seed)
 
     ddp = "LOCAL_RANK" in os.environ
@@ -261,7 +309,7 @@ def main(
     # NanoRT: initialise val AUROC callback (rank 0 only; not DDP-safe)
     val_callback: ValAUROCCallback | None = None
     if val_tasks is not None and rank == 0 and not ddp:
-        _freq = val_eval_freq if val_eval_freq is not None else max(1, max_steps // 100)
+        _freq = val_eval_freq if val_eval_freq is not None else 100
         val_callback = ValAUROCCallback(
             val_tasks=val_tasks,
             batch_size=batch_size,
@@ -334,6 +382,16 @@ def main(
         d_text=d_text,
         num_heads=num_heads,
         d_ff=d_ff,
+        sigreg_layer=sigreg_layer,
+        sigreg_n_proj=sigreg_n_proj,
+        sigreg_proj_hidden_mult=sigreg_proj_hidden_mult,
+        sigreg_proj_out_div=sigreg_proj_out_div,
+        sigreg_proj_hidden_layers=sigreg_proj_hidden_layers,
+        sigreg_knots=sigreg_knots,
+        sigreg_t_max=sigreg_t_max,
+        sigreg_min_group=sigreg_min_group,
+        sigreg_use_row=sigreg_lambda_row > 0.0,
+        sigreg_use_col=sigreg_lambda_col > 0.0,
     )
     if load_ckpt_path is not None:
         load_ckpt_path = Path(load_ckpt_path).expanduser()
@@ -342,6 +400,13 @@ def main(
 
     net = net.to(device)
     net = net.to(torch.bfloat16)
+
+    # SIGReg runs in fp32 (CF quadrature + BatchNorm are numerically sensitive):
+    # cast the projector submodule back to fp32 after the global bf16 cast.
+    sigreg_enabled = sigreg_layer is not None
+    sigreg_active = sigreg_enabled and (sigreg_lambda_row + sigreg_lambda_col) > 0.0
+    if sigreg_enabled:
+        net.sigreg.float()
 
     # ── Optimiser setup ───────────────────────────────────────────────────────
     if optimizer == "muon":
@@ -379,11 +444,14 @@ def main(
                 anneal_strategy="linear",
             )
     else:
+        main_params = [
+            p for n, p in net.named_parameters() if not n.startswith("sigreg.")
+        ]
         if rank == 0:
-            param_count = sum(p.numel() for p in net.parameters())
+            param_count = sum(p.numel() for p in main_params)
             print(f"{param_count=:_}")
         opt = optim.AdamW(
-            net.parameters(),
+            main_params,
             lr=lr,
             weight_decay=wd,
             betas=(0.9, 0.999),
@@ -398,6 +466,18 @@ def main(
                 pct_start=0.2,
                 anneal_strategy="linear",
             )
+
+    # SIGReg projector — separate fp32 AdamW (kept out of the fused bf16 groups).
+    opt_sigreg = None
+    if sigreg_active:
+        opt_sigreg = optim.AdamW(
+            net.sigreg.parameters(),
+            lr=sigreg_lr if sigreg_lr is not None else lr,
+            weight_decay=0.0,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            fused=False,
+        )
 
     if ddp:
         net = DDP(net)
@@ -474,7 +554,7 @@ def main(
                     batch["is_targets"][true_batch_size:, :] = False
                     batch["is_padding"][true_batch_size:, :] = True
 
-                    loss, yhat_dict = net(batch)
+                    loss, yhat_dict, _ = net(batch)
 
                     if task_type == "clf":
                         yhat = yhat_dict["boolean"][batch["is_targets"]]
@@ -558,6 +638,8 @@ def main(
             opt_adamw.zero_grad(set_to_none=True)
         else:
             opt.zero_grad(set_to_none=True)
+        if opt_sigreg is not None:
+            opt_sigreg.zero_grad(set_to_none=True)
 
     def opt_step():
         if optimizer == "muon":
@@ -570,6 +652,8 @@ def main(
             opt.step()
             if lr_schedule:
                 lrs.step()
+        if opt_sigreg is not None:
+            opt_sigreg.step()
 
     pbar = tqdm(total=max_steps, desc="steps", disable=rank != 0)
 
@@ -614,9 +698,18 @@ def main(
             if rank == 0:
                 wandb.log({"load_time": load_time}, step=steps)
 
-            loss, _yhat_dict = net(batch)
+            loss, _yhat_dict, sigreg = net(batch)
+            # SIGReg: L = (1-λc-λr)·L_sup + λc·R_col + λr·R_row  (paper §2.4)
+            lc, lr_ = sigreg_lambda_col, sigreg_lambda_row
+            sup_weighted = (1.0 - lc - lr_) * loss
+            row_weighted = lr_ * sigreg["row"]
+            col_weighted = lc * sigreg["col"]
+            if sigreg_active:
+                total_loss = sup_weighted + col_weighted + row_weighted
+            else:
+                total_loss = loss
             opt_zero_grad()
-            loss.backward()
+            total_loss.backward()
 
             grad_norm = get_total_norm(
                 [p.grad for p in net.parameters() if p.grad is not None]
@@ -636,6 +729,30 @@ def main(
                     "epochs": steps / len(loader),
                     "grad_norm": grad_norm,
                 }
+                if sigreg_enabled:
+                    if sigreg_lambda_row > 0.0:
+                        log["sigreg/row"] = sigreg["row"].detach().float()
+                        log["loss/sigreg_row_weighted"] = row_weighted.detach().float()
+                    if sigreg_lambda_col > 0.0:
+                        log["sigreg/col"] = sigreg["col"].detach().float()
+                        log["loss/sigreg_col_weighted"] = col_weighted.detach().float()
+                    log["loss/sup_weighted"] = sup_weighted.detach().float()
+                    log["loss/sigreg_weighted"] = (
+                        row_weighted + col_weighted
+                    ).detach().float()
+                    log["loss_total"] = total_loss.detach().float()
+                    for key, value in sigreg.items():
+                        if key.startswith("row/") and sigreg_lambda_row > 0.0:
+                            log[f"sigreg/{key}"] = value.detach().float()
+                        elif key.startswith("col/") and sigreg_lambda_col > 0.0:
+                            log[f"sigreg/{key}"] = value.detach().float()
+                    _diag_every = val_eval_freq if val_eval_freq else 200
+                    if sigreg["embed"] is not None and steps % _diag_every == 0:
+                        erank, mstd = geometry_diagnostics(
+                            sigreg["embed"], batch["is_padding"]
+                        )
+                        log["sigreg/effective_rank"] = erank
+                        log["sigreg/mean_dim_std"] = mstd
                 if optimizer == "muon":
                     log["lr_muon"] = opt_muon.param_groups[0]["lr"]
                     log["lr_adamw"] = opt_adamw.param_groups[0]["lr"]

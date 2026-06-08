@@ -13,6 +13,8 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
+from rt.sigreg import SIGReg
+
 allow_ops_in_compiled_graph()
 flex_attention = torch.compile(flex_attention)
 
@@ -109,6 +111,17 @@ class RelationalTransformer(nn.Module):
         d_text,
         num_heads,
         d_ff,
+        # SIGReg: early-layer geometry regularization (None = disabled).
+        sigreg_layer=None,
+        sigreg_n_proj=64,
+        sigreg_proj_hidden_mult=4,
+        sigreg_proj_out_div=4,
+        sigreg_proj_hidden_layers=1,
+        sigreg_knots=17,
+        sigreg_t_max=3.0,
+        sigreg_min_group=8,
+        sigreg_use_row=True,
+        sigreg_use_col=True,
     ):
         super().__init__()
 
@@ -149,6 +162,27 @@ class RelationalTransformer(nn.Module):
         )
         self.norm_out = nn.RMSNorm(d_model)
         self.d_model = d_model
+
+        # SIGReg: regularize the hidden state output by block `sigreg_layer`.
+        self.sigreg_layer = sigreg_layer
+        self.sigreg_use_row = sigreg_use_row
+        self.sigreg_use_col = sigreg_use_col
+        if sigreg_layer is not None:
+            assert 0 <= sigreg_layer < num_blocks, (
+                f"sigreg_layer={sigreg_layer} out of range for {num_blocks} blocks"
+            )
+            self.sigreg = SIGReg(
+                d_model,
+                n_proj=sigreg_n_proj,
+                proj_hidden_mult=sigreg_proj_hidden_mult,
+                proj_out_div=sigreg_proj_out_div,
+                proj_hidden_layers=sigreg_proj_hidden_layers,
+                knots=sigreg_knots,
+                t_max=sigreg_t_max,
+                min_group=sigreg_min_group,
+            )
+        else:
+            self.sigreg = None
 
     def forward(self, batch):
         node_idxs = batch["node_idxs"]
@@ -223,8 +257,44 @@ class RelationalTransformer(nn.Module):
                 * ((batch["sem_types"] == i) & batch["masks"] & ~is_padding)[..., None]
             )
 
+        sig_x = None
         for i, block in enumerate(self.blocks):
             x = block(x, block_masks)
+            if self.sigreg is not None and i == self.sigreg_layer:
+                sig_x = x
+
+        # SIGReg auxiliary losses — training-only; skipped at eval so the
+        # projector adds zero inference cost. `sigreg_embed` is the detached
+        # backbone hidden state at the regularized layer, used by main.py for
+        # geometry diagnostics (effective rank / per-dim std) outside compile.
+        if self.sigreg is not None and self.training and sig_x is not None:
+            sigreg_row, sigreg_col, sigreg_stats = self.sigreg(
+                sig_x,
+                node_idxs,
+                table_name_idxs,
+                col_name_idxs,
+                is_padding,
+                use_row=self.sigreg_use_row,
+                use_col=self.sigreg_use_col,
+            )
+            sigreg_embed = sig_x.detach()
+        else:
+            sigreg_row = torch.zeros((), device=device, dtype=torch.float32)
+            sigreg_col = torch.zeros((), device=device, dtype=torch.float32)
+            sigreg_stats = {
+                f"{view}/{key}": sigreg_row
+                for view in ("row", "col")
+                for key in (
+                    "groups_present",
+                    "groups_valid",
+                    "groups_valid_frac",
+                    "group_size_present_mean",
+                    "group_size_valid_mean",
+                    "group_size_valid_max",
+                    "cells_covered_frac",
+                )
+            }
+            sigreg_embed = None
 
         x = self.norm_out(x)
 
@@ -264,4 +334,9 @@ class RelationalTransformer(nn.Module):
 
         loss_out = loss_out / masks.sum()
 
-        return loss_out, yhat_out
+        return loss_out, yhat_out, {
+            "row": sigreg_row,
+            "col": sigreg_col,
+            "embed": sigreg_embed,
+            **sigreg_stats,
+        }

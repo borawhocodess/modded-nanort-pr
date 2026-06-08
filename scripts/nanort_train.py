@@ -5,6 +5,8 @@ This is the file competitors fork. Modify only:
   2. The transformer architecture (num_blocks, d_model, num_heads, d_ff,
      and any changes to rt/model.py)
   3. The optimizer (--optimizer muon, --muon-lr)
+  4. SIGReg early-layer geometry regularization (--sigreg-layer, --sigreg-lambda-row,
+     --sigreg-lambda-col). Training-only; adds zero inference cost.
 
 Do NOT modify: val_tasks, val_eval_freq, time_budget_minutes, or the database
 lists. Those define the competition protocol.
@@ -12,6 +14,9 @@ lists. Those define the competition protocol.
 Run:
     pixi run python scripts/nanort_train.py --holdout-db rel-avito
     pixi run python scripts/nanort_train.py --holdout-db rel-avito --optimizer muon --muon-lr 5e-3
+    # SIGReg on the first block, both views (paper-style λ=0.01):
+    pixi run python scripts/nanort_train.py --holdout-db rel-avito --optimizer muon \
+        --muon-lr 5e-3 --sigreg-layer 0 --sigreg-lambda-row 0.01 --sigreg-lambda-col 0.01
 """
 
 import argparse
@@ -42,9 +47,24 @@ def clf_tasks_for_db(db_name: str):
     return [t for t in ALL_CLF_TASKS if t[0] == db_name]
 
 
-def run(holdout_db: str, optimizer: str, muon_lr: float) -> None:
+def run(
+    holdout_db: str,
+    optimizer: str,
+    muon_lr: float,
+    sigreg_layer=None,
+    sigreg_lambda_row: float = 0.0,
+    sigreg_lambda_col: float = 0.0,
+    sigreg_n_proj: int = 64,
+    sigreg_lr: float | None = None,
+    sigreg_min_group: int = 8,
+) -> None:
     assert holdout_db in HOLDOUT_CANDIDATES, f"Unknown holdout: {holdout_db}"
     assert optimizer in ("adamw", "muon"), f"Unknown optimizer: {optimizer}"
+
+    # A negative layer (e.g. the -1 default passed by plx_nanort_train.yaml)
+    # disables SIGReg, so the baseline stays byte-for-byte identical.
+    if sigreg_layer is not None and sigreg_layer < 0:
+        sigreg_layer = None
 
     train_artifact_db = f"nanort-train-{holdout_db}"
     train_artifact_path = os.path.join(PRE, train_artifact_db)
@@ -85,6 +105,8 @@ def run(holdout_db: str, optimizer: str, muon_lr: float) -> None:
     run_name_tag = f"{optimizer}"
     if optimizer == "muon":
         run_name_tag += f"-lr{muon_lr}"
+    if sigreg_layer is not None:
+        run_name_tag += f"-sig{sigreg_layer}r{sigreg_lambda_row}c{sigreg_lambda_col}"
 
     main(
         # misc
@@ -121,6 +143,13 @@ def run(holdout_db: str, optimizer: str, muon_lr: float) -> None:
         d_model=256,                # ← competitors may adjust
         num_heads=8,                # ← competitors may adjust
         d_ff=1024,                  # ← competitors may adjust
+        # SIGReg geometry regularization (← competitors may adjust)
+        sigreg_layer=sigreg_layer,
+        sigreg_lambda_row=sigreg_lambda_row,
+        sigreg_lambda_col=sigreg_lambda_col,
+        sigreg_n_proj=sigreg_n_proj,
+        sigreg_lr=sigreg_lr,
+        sigreg_min_group=sigreg_min_group,
         # NanoRT: competition hooks (do not modify)
         val_tasks=val_tasks,
         val_eval_freq=int(os.environ.get("NANORT_VAL_EVAL_FREQ", "100")),
@@ -148,5 +177,52 @@ if __name__ == "__main__":
         default=5e-3,
         help="Muon group learning rate (ignored when --optimizer adamw)",
     )
+    parser.add_argument(
+        "--sigreg-layer",
+        type=int,
+        default=None,
+        help="Block index to apply SIGReg to (0 = first block, as in the paper). "
+        "Omit to disable SIGReg.",
+    )
+    parser.add_argument(
+        "--sigreg-lambda-row",
+        type=float,
+        default=0.0,
+        help="SIGReg row-view (per-node) coefficient λr",
+    )
+    parser.add_argument(
+        "--sigreg-lambda-col",
+        type=float,
+        default=0.0,
+        help="SIGReg column-view (per-feature) coefficient λc",
+    )
+    parser.add_argument(
+        "--sigreg-n-proj",
+        type=int,
+        default=64,
+        help="Number of random 1-D projection directions per view",
+    )
+    parser.add_argument(
+        "--sigreg-lr",
+        type=float,
+        default=None,
+        help="Projector learning rate (defaults to the main AdamW lr)",
+    )
+    parser.add_argument(
+        "--sigreg-min-group",
+        type=int,
+        default=8,
+        help="Minimum valid cells per row/column group used by SIGReg",
+    )
     args = parser.parse_args()
-    run(args.holdout_db, args.optimizer, args.muon_lr)
+    run(
+        args.holdout_db,
+        args.optimizer,
+        args.muon_lr,
+        sigreg_layer=args.sigreg_layer,
+        sigreg_lambda_row=args.sigreg_lambda_row,
+        sigreg_lambda_col=args.sigreg_lambda_col,
+        sigreg_n_proj=args.sigreg_n_proj,
+        sigreg_lr=args.sigreg_lr,
+        sigreg_min_group=args.sigreg_min_group,
+    )

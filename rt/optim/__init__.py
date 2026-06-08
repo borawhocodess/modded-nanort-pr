@@ -10,12 +10,17 @@ def build_muon_param_groups(model) -> tuple[list, list]:
     AdamW group: everything else — 1-D params, encoders, decoders, norms,
     mask embeddings, classifier head.
 
+    SIGReg projector params (``sigreg.*``) are excluded entirely — they are fp32
+    and trained by a separate AdamW optimizer (see rt/main.py).
+
     Returns (muon_params, adamw_params).
     """
     muon_params = []
     adamw_params = []
 
     for name, param in model.named_parameters():
+        if name.startswith("sigreg."):
+            continue
         parts = name.split(".")
         in_block = parts[0] == "blocks" and len(parts) >= 2
         in_attn = in_block and len(parts) >= 3 and parts[2] == "attns"
