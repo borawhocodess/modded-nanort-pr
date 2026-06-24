@@ -89,9 +89,10 @@ class ValAUROCCallback:
         self.timer = timer
         self._time_to_target: float | None = None  # seconds; set once
 
-    def step(self, step: int, net: torch.nn.Module) -> None:
+    def step(self, step: int, net: torch.nn.Module) -> bool:
+        """Returns True only on the step at which the AUROC target is first reached."""
         if step != 1 and step % self.eval_every != 0:
-            return
+            return False
 
         net.eval()
         preds, labels, losses = [], [], []
@@ -125,6 +126,7 @@ class ValAUROCCallback:
             "val/score_db": float("nan"),
         }
 
+        target_just_reached = False
         if (
             self._time_to_target is None
             and auroc >= self.TARGET_AUROC
@@ -132,6 +134,7 @@ class ValAUROCCallback:
         ):
             self._time_to_target = self.timer.elapsed()
             log["train/time_to_target"] = self._time_to_target
+            target_just_reached = True
             print(
                 f"\n*** TARGET REACHED: auroc={auroc:.4f} "
                 f"time_to_target={self._time_to_target:.1f}s ***"
@@ -143,6 +146,7 @@ class ValAUROCCallback:
             f"  val/mtp_loss={mtp_loss:.4f}"
         )
         net.train()
+        return target_just_reached
 
     def finalize(self, step: int) -> None:
         """Log time_to_target=-1 if the target was never reached."""
@@ -157,6 +161,28 @@ def seed_everything(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _upload_checkpoint_to_hf(local_path: str, repo_id: str, path_in_repo: str) -> None:
+    """Upload a checkpoint to a HuggingFace model repo (token read from HF_TOKEN env).
+
+    Best-effort: a missing token / lack of write access logs a warning instead of
+    crashing the run, since the target has already been reached by this point.
+    """
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+        api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+        api.upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="model",
+        )
+        print(f"uploaded checkpoint to hf://{repo_id}/{path_in_repo}")
+    except Exception as exc:  # noqa: BLE001 — never let upload kill the run
+        print(f"WARNING: HF checkpoint upload to {repo_id}/{path_in_repo} failed: {exc}")
 
 
 @torch.no_grad()
@@ -275,6 +301,10 @@ def main(
     val_eval_freq=None,
     # NanoRT: 45-minute wall-clock budget
     time_budget_minutes=None,
+    # NanoRT: snapshot + HuggingFace upload at the moment the AUROC target is reached
+    hf_ckpt_repo: str | None = None,   # e.g. "GabrielVeloso/NanoRT"; None disables upload
+    hf_ckpt_name: str = "sigreg",      # checkpoint basename → checkpoints/{name}.pt on HF
+    stop_at_target: bool = False,      # end the run as soon as the target is reached
 ):
     if sigreg_layer is not None and sigreg_layer < 0:
         sigreg_layer = None
@@ -620,12 +650,14 @@ def main(
 
         return metrics
 
-    def checkpoint(best=False, db_name="", table_name=""):
+    def checkpoint(best=False, db_name="", table_name="", name=None):
         if rank != 0:
-            return
+            return None
         save_ckpt_dir_ = Path(save_ckpt_dir).expanduser()
         save_ckpt_dir_.mkdir(parents=True, exist_ok=True)
-        if best:
+        if name is not None:
+            save_ckpt_path = f"{save_ckpt_dir_}/{name}.pt"
+        elif best:
             save_ckpt_path = f"{save_ckpt_dir_}/{db_name}_{table_name}_best.pt"
         else:
             save_ckpt_path = f"{save_ckpt_dir_}/{steps=}.pt"
@@ -633,6 +665,7 @@ def main(
         state_dict = net.module.state_dict() if ddp else net.state_dict()
         torch.save(state_dict, save_ckpt_path)
         print(f"saved checkpoint to {save_ckpt_path}")
+        return save_ckpt_path
 
     def opt_zero_grad():
         if optimizer == "muon":
@@ -773,7 +806,17 @@ def main(
 
             # NanoRT: zero-shot AUROC evaluation
             if val_callback is not None and not done:
-                val_callback.step(steps, net)
+                target_just_reached = val_callback.step(steps, net)
+                # On first reaching the target, optionally snapshot the model,
+                # upload it to HuggingFace, and stop the run.
+                if target_just_reached and hf_ckpt_repo:
+                    ckpt_path = checkpoint(name=hf_ckpt_name)
+                    if ckpt_path is not None:
+                        _upload_checkpoint_to_hf(
+                            ckpt_path, hf_ckpt_repo, f"checkpoints/{hf_ckpt_name}.pt"
+                        )
+                if target_just_reached and stop_at_target:
+                    done = True
 
             pbar.update(1)
 

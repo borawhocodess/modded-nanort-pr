@@ -58,6 +58,9 @@ def run(
     sigreg_lr: float | None = None,
     sigreg_min_group: int = 8,
     sigreg_col_global_pool: bool = True,
+    hf_ckpt_repo: str | None = None,
+    hf_ckpt_name: str = "sigreg",
+    stop_at_target: bool = False,
 ) -> None:
     assert holdout_db in HOLDOUT_CANDIDATES, f"Unknown holdout: {holdout_db}"
     assert optimizer in ("adamw", "muon"), f"Unknown optimizer: {optimizer}"
@@ -156,6 +159,10 @@ def run(
         val_tasks=val_tasks,
         val_eval_freq=int(os.environ.get("NANORT_VAL_EVAL_FREQ", "100")),
         time_budget_minutes=45,
+        # NanoRT: checkpoint snapshot + HuggingFace upload at the target
+        hf_ckpt_repo=hf_ckpt_repo,
+        hf_ckpt_name=hf_ckpt_name,
+        stop_at_target=stop_at_target,
     )
 
 
@@ -225,6 +232,26 @@ if __name__ == "__main__":
         "across the batch (recommended; large uniform groups), 0 = per-sequence "
         "groups (legacy).",
     )
+    parser.add_argument(
+        "--hf-ckpt-repo",
+        type=str,
+        default="",
+        help="HuggingFace model repo to upload the checkpoint to when the AUROC "
+        "target is first reached (e.g. 'GabrielVeloso/NanoRT'). Empty = no upload. "
+        "Requires HF_TOKEN with write access to the repo.",
+    )
+    parser.add_argument(
+        "--hf-ckpt-name",
+        type=str,
+        default="sigreg",
+        help="Checkpoint basename; uploaded to checkpoints/<name>.pt on HF.",
+    )
+    parser.add_argument(
+        "--stop-at-target",
+        action="store_true",
+        help="End the run as soon as the AUROC target is reached (instead of "
+        "training for the full 45-minute budget).",
+    )
     args = parser.parse_args()
     run(
         args.holdout_db,
@@ -237,4 +264,7 @@ if __name__ == "__main__":
         sigreg_lr=args.sigreg_lr,
         sigreg_min_group=args.sigreg_min_group,
         sigreg_col_global_pool=bool(args.sigreg_col_pool),
+        hf_ckpt_repo=args.hf_ckpt_repo or None,
+        hf_ckpt_name=args.hf_ckpt_name,
+        stop_at_target=args.stop_at_target,
     )

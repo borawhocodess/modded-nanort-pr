@@ -4,13 +4,14 @@ This repository hosts the *nanoRT speedrun*, in which we (collaboratively|compet
 
 The code is derived from [snap-stanford/relational-transformer](https://github.com/snap-stanford/relational-transformer) with the inspiration of [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt).
 
-The current record beats the baseline in **12m 27s** with the following techniques:
+The current record beats the baseline in **7m 26s** with the following techniques:
 
-* Replaced AdamW with [Muon](https://github.com/KellerJordan/Muon) (`muon_lr=0.01`) for all matrix parameters, keeping AdamW for embeddings and biases.
+* Replaced AdamW with [Muon](https://github.com/KellerJordan/Muon) (`muon_lr=5e-3`) for all matrix parameters, keeping AdamW for embeddings and biases.
+* Added **SIGReg column-view** geometry regularization on the first block (`sigreg_layer=0`, `sigreg_lambda_col=1e-3`, global column pooling), which de-collapses the early per-feature representation. Training-only — adds zero inference cost. See [`SIGREG.md`](SIGREG.md).
 
 The following techniques were evaluated but did not lead to improvements:
 
-* (To be filled in as records land)
+* SIGReg **row-view** (`sigreg_lambda_row`): regularizes the post-aggregation relation stream (`dr`), which is the wrong stream — it did not improve over the column-only variant and destabilized training at larger λ.
 
 
 ## Running the current record
@@ -47,7 +48,8 @@ The 0.81621 target was selected to match the baseline calibration run over the u
 | #  | Record            | Date       | Description              | Links                      | Contributors     |
 | -- | ----------------- | ---------- | ------------------------ | -------------------------- | ---------------- |
 | 1  | 0.81621 AUROC @ 45 min | TBD   | Baseline                 | [log](records/01_baseline) |                  |
-| 2  | **12m 27s**       | 2026-05-05 | Muon optimizer (`lr=0.01`) | [log](records/02_muon)   | Gabriel Veloso   |
+| 2  | 12m 27s           | 2026-05-05 | Muon optimizer (`muon_lr=5e-3`) | [log](records/02_muon) | Gabriel Veloso   |
+| 3  | **7m 26s**        | 2026-06-24 | Muon + SIGReg col-view (`sigreg_layer=0`, `λ_col=1e-3`) | [log](records/03_sigreg) | Gabriel Veloso   |
 
 
 ## Rules
