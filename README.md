@@ -7,7 +7,7 @@ The code is derived from [snap-stanford/relational-transformer](https://github.c
 The current record beats the baseline in **7m 26s** with the following techniques:
 
 * Replaced AdamW with [Muon](https://github.com/KellerJordan/Muon) (`muon_lr=5e-3`) for all matrix parameters, keeping AdamW for embeddings and biases.
-* Added **SIGReg column-view** geometry regularization on the first block (`sigreg_layer=0`, `sigreg_lambda_col=1e-3`, global column pooling), which de-collapses the early per-feature representation. Training-only — adds zero inference cost. See [`SIGREG.md`](SIGREG.md).
+* Added **SIGReg column-view** geometry regularization on the first block (`sigreg_layer=0`, `sigreg_lambda_col=1e-3`, global column pooling), which de-collapses the early per-feature representation. Training-only — adds zero inference cost.
 
 The following techniques were evaluated but did not lead to improvements:
 

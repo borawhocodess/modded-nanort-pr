@@ -5,3 +5,6 @@ __pycache__
 /wandb
 .vscode
 /ckpts
+.DS_Store
+.polyaxon/
+backup/

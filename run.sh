@@ -9,7 +9,7 @@ HF_REPO="${HF_REPO:-gabrielveloso/nanort-artifacts}"
 OPTIMIZER="${OPTIMIZER:-muon}"
 MUON_LR="${MUON_LR:-5e-3}"
 
-# SIGReg col-view record config (see SIGREG.md / README.md):
+# SIGReg col-view record config (see README.md):
 SIGREG_LAYER="${SIGREG_LAYER:-0}"
 SIGREG_LAMBDA_ROW="${SIGREG_LAMBDA_ROW:-0.0}"
 SIGREG_LAMBDA_COL="${SIGREG_LAMBDA_COL:-0.001}"
