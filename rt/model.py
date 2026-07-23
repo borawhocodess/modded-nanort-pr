@@ -1,23 +1,23 @@
-import json
-import os
 from functools import partial
-from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 from einops._torch_specific import allow_ops_in_compiled_graph
-from ml_dtypes import bfloat16
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from rt.sigreg import SIGReg
+from rt.simplicial_attention import RelAttn, SimplicialNbrAttn, build_rel_batch
 
 allow_ops_in_compiled_graph()
 flex_attention = torch.compile(flex_attention)
 
+
+# ---------------------------------------------------------------------------
+# Standard building blocks
+# ---------------------------------------------------------------------------
 
 class MaskedAttention(nn.Module):
     def __init__(self, d_model, num_heads):
@@ -61,32 +61,71 @@ class FFN(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
+# ---------------------------------------------------------------------------
+# Transformer block
+# ---------------------------------------------------------------------------
+
 class RelationalBlock(nn.Module):
-    def __init__(
-        self,
-        d_model,
-        num_heads,
-        d_ff,
-    ):
+    def __init__(self, d_model, num_heads, d_ff, use_simplicial=True,
+                 update_relations=True, qk_norm=True):
         super().__init__()
 
-        self.norms = nn.ModuleDict(
-            {l: nn.RMSNorm(d_model) for l in ["feat", "nbr", "col", "full", "ffn"]}
-        )
+        norm_names = ["feat", "col", "full", "ffn"]
+        if use_simplicial:
+            norm_names += ["nbr_x", "nbr_r"]
+        self.norms = nn.ModuleDict({l: nn.RMSNorm(d_model) for l in norm_names})
         self.attns = nn.ModuleDict(
-            {
-                l: MaskedAttention(d_model, num_heads)
-                for l in ["feat", "nbr", "col", "full"]
-            }
+            {l: MaskedAttention(d_model, num_heads) for l in ["feat", "col", "full"]}
         )
+        self.use_simplicial = use_simplicial
+        # When False the relation stream stays static (HGT-style operators):
+        # cells still read r via SimplicialNbrAttn, but RelAttn never updates r,
+        # so it carries the frozen text-derived init r^(0) through every block.
+        self.update_relations = update_relations and use_simplicial
+        if use_simplicial:
+            self.nbr_attn = SimplicialNbrAttn(d_model, num_heads, qk_norm=qk_norm)
+            if self.update_relations:
+                self.rel_attn = RelAttn(d_model, num_heads, qk_norm=qk_norm)
         self.ffn = FFN(d_model, d_ff)
 
-    def forward(self, x, block_masks):
-        for l in ["col", "feat", "nbr", "full"]:
+    def forward(self, x, r, block_masks, rel_batch, need_stats=False):
+        for l in ["col", "feat"]:
             x = x + self.attns[l](self.norms[l](x), block_mask=block_masks[l])
-        x = x + self.ffn(self.norms["ffn"](x))
-        return x
 
+        block_stats = None
+        if self.use_simplicial:
+            x_n = self.norms["nbr_x"](x)
+            r_n = self.norms["nbr_r"](r)
+
+            dx, nbr_entropy = self.nbr_attn(x_n, r_n, rel_batch, need_stats=need_stats)
+            if self.update_relations:
+                dr, rel_entropy = self.rel_attn(r_n, x_n, rel_batch, need_stats=need_stats)
+            else:
+                dr, rel_entropy = None, (x.new_zeros(()) if need_stats else None)
+            if need_stats:
+                nbr_delta_norm = dx.norm()
+                rel_delta_norm = dr.norm() if dr is not None else x.new_zeros(())
+                block_stats = {
+                    "nbr_entropy": nbr_entropy,
+                    "rel_entropy": rel_entropy,
+                    "nbr_delta_norm": nbr_delta_norm,
+                    "rel_delta_norm": rel_delta_norm,
+                    "nbr_delta_frac": nbr_delta_norm / x.norm().clamp(min=1e-8),
+                    "rel_delta_frac": rel_delta_norm / r.norm().clamp(min=1e-8),
+                }
+            x = x + dx
+            if dr is not None:
+                r = r + dr
+
+        x = x + self.attns["full"](self.norms["full"](x), block_mask=block_masks["full"])
+        x = x + self.ffn(self.norms["ffn"](x))
+
+        return x, r, block_stats
+
+
+# ---------------------------------------------------------------------------
+# Block mask helpers
+# ---------------------------------------------------------------------------
 
 def _make_block_mask(mask, batch_size, seq_len, device):
     def _mod(b, h, q_idx, kv_idx):
@@ -103,14 +142,14 @@ def _make_block_mask(mask, batch_size, seq_len, device):
     )
 
 
+# ---------------------------------------------------------------------------
+# Full model
+# ---------------------------------------------------------------------------
+
 class RelationalTransformer(nn.Module):
     def __init__(
-        self,
-        num_blocks,
-        d_model,
-        d_text,
-        num_heads,
-        d_ff,
+        self, num_blocks, d_model, d_text, num_heads, d_ff, simplicial_layers=None,
+        update_relations=True, qk_norm=True,
         # SIGReg: early-layer geometry regularization (None = disabled).
         sigreg_layer=None,
         sigreg_n_proj=64,
@@ -124,47 +163,75 @@ class RelationalTransformer(nn.Module):
         sigreg_use_row=True,
         sigreg_use_col=True,
     ):
+        """``simplicial_layers``: block indices that get the simplicial pair
+        (SimplicialNbrAttn + RelAttn). None means all blocks; an empty list
+        disables the simplicial path entirely.
+
+        ``update_relations``: when False the relation stream stays static
+        (HGT-style) — RelAttn is dropped and r keeps its frozen init r^(0).
+        ``qk_norm``: per-head RMSNorm on the trilinear score factors.
+
+        ``sigreg_layer``: block index whose (post-block, pre-final-norm) cell
+        hidden state is geometry-regularized by SIGReg. None disables SIGReg;
+        the lambdas in main.py gate whether the loss actually contributes."""
         super().__init__()
+
+        if simplicial_layers is None:
+            simplicial_layers = range(num_blocks)
+        simplicial_layers = set(simplicial_layers)
+        assert all(0 <= i < num_blocks for i in simplicial_layers), simplicial_layers
+        self.has_simplicial = len(simplicial_layers) > 0
 
         self.enc_dict = nn.ModuleDict(
             {
-                "number": nn.Linear(1, d_model, bias=True),
-                "text": nn.Linear(d_text, d_model, bias=True),
-                "datetime": nn.Linear(1, d_model, bias=True),
+                "number":   nn.Linear(1,      d_model, bias=True),
+                "text":     nn.Linear(d_text, d_model, bias=True),
+                "datetime": nn.Linear(1,      d_model, bias=True),
                 "col_name": nn.Linear(d_text, d_model, bias=True),
-                "boolean": nn.Linear(1, d_model, bias=True),
+                "boolean":  nn.Linear(1,      d_model, bias=True),
+                "relation": nn.Linear(d_text, d_model, bias=True),
             }
         )
         self.dec_dict = nn.ModuleDict(
             {
-                "number": nn.Linear(d_model, 1, bias=True),
-                "text": nn.Linear(d_model, d_text, bias=True),
-                "datetime": nn.Linear(d_model, 1, bias=True),
-                "boolean": nn.Linear(d_model, 1, bias=True),
+                "number":   nn.Linear(d_model, 1,      bias=True),
+                "text":     nn.Linear(d_model, d_text, bias=True),
+                "datetime": nn.Linear(d_model, 1,      bias=True),
+                "boolean":  nn.Linear(d_model, 1,      bias=True),
             }
         )
         self.norm_dict = nn.ModuleDict(
             {
-                "number": nn.RMSNorm(d_model),
-                "text": nn.RMSNorm(d_model),
+                "number":   nn.RMSNorm(d_model),
+                "text":     nn.RMSNorm(d_model),
                 "datetime": nn.RMSNorm(d_model),
                 "col_name": nn.RMSNorm(d_model),
-                "boolean": nn.RMSNorm(d_model),
+                "boolean":  nn.RMSNorm(d_model),
+                "relation": nn.RMSNorm(d_model),
             }
         )
         self.mask_embs = nn.ParameterDict(
-            {
-                t: nn.Parameter(torch.randn(d_model))
-                for t in ["number", "text", "datetime", "boolean"]
-            }
+            {t: nn.Parameter(torch.randn(d_model))
+             for t in ["number", "text", "datetime", "boolean"]}
         )
         self.blocks = nn.ModuleList(
-            [RelationalBlock(d_model, num_heads, d_ff) for i in range(num_blocks)]
+            [
+                RelationalBlock(
+                    d_model, num_heads, d_ff,
+                    use_simplicial=(i in simplicial_layers),
+                    update_relations=update_relations,
+                    qk_norm=qk_norm,
+                )
+                for i in range(num_blocks)
+            ]
         )
         self.norm_out = nn.RMSNorm(d_model)
         self.d_model = d_model
 
         # SIGReg: regularize the hidden state output by block `sigreg_layer`.
+        # Same mechanism as the SigReg record run — operates on the per-cell
+        # hidden state (B, S, E), which the simplicial cell-update already fed
+        # into, so it composes with the simplicial path without extra coupling.
         self.sigreg_layer = sigreg_layer
         self.sigreg_use_row = sigreg_use_row
         self.sigreg_use_col = sigreg_use_col
@@ -186,69 +253,69 @@ class RelationalTransformer(nn.Module):
         else:
             self.sigreg = None
 
-    def forward(self, batch):
-        node_idxs = batch["node_idxs"]
-        f2p_nbr_idxs = batch["f2p_nbr_idxs"]
-        col_name_idxs = batch["col_name_idxs"]
+    def forward(
+        self,
+        batch,
+        return_embeddings: bool = False,
+        need_stats: bool = True,
+    ):
+        node_idxs      = batch["node_idxs"]
+        f2p_nbr_idxs   = batch["f2p_nbr_idxs"]
+        f2p_rel_idxs   = batch["f2p_rel_idxs"]
+        col_name_idxs  = batch["col_name_idxs"]
         table_name_idxs = batch["table_name_idxs"]
-        is_padding = batch["is_padding"]
-        batch_size, seq_len = node_idxs.shape
-
+        is_padding     = batch["is_padding"]
         batch_size, seq_len = node_idxs.shape
         device = node_idxs.device
 
-        # Padding mask for attention pairs (allow only non-pad -> non-pad)
-        pad = (~is_padding[:, :, None]) & (~is_padding[:, None, :])  # (B, S, S)
+        # ── Attention masks ────────────────────────────────────────────────
+        pad      = (~is_padding[:, :, None]) & (~is_padding[:, None, :])
+        same_node = node_idxs[:, :, None] == node_idxs[:, None, :]
+        kv_in_f2p = (node_idxs[:, None, :, None] == f2p_nbr_idxs[:, :, None, :]).any(-1)
 
-        # cells in the same node
-        same_node = node_idxs[:, :, None] == node_idxs[:, None, :]  # (B, S, S)
+        same_col_table = (
+            (col_name_idxs[:, :, None]  == col_name_idxs[:, None, :]) &
+            (table_name_idxs[:, :, None] == table_name_idxs[:, None, :])
+        )
 
-        # kv index is among q's foreign -> primary neighbors
-        kv_in_f2p = (node_idxs[:, None, :, None] == f2p_nbr_idxs[:, :, None, :]).any(
-            -1
-        )  # (B, S, S)
-
-        # q index is among kv's primary -> foreign neighbors (reverse relation)
-        q_in_f2p = (node_idxs[:, :, None, None] == f2p_nbr_idxs[:, None, :, :]).any(
-            -1
-        )  # (B, S, S)
-
-        # Same column AND same table
-        same_col_table = (col_name_idxs[:, :, None] == col_name_idxs[:, None, :]) & (
-            table_name_idxs[:, :, None] == table_name_idxs[:, None, :]
-        )  # (B, S, S)
-
-        # Final boolean masks (apply padding once here)
         attn_masks = {
             "feat": (same_node | kv_in_f2p) & pad,
-            "nbr": q_in_f2p & pad,
-            "col": same_col_table & pad,
+            "col":  same_col_table & pad,
             "full": pad,
         }
-
-        # Make them contiguous for better kernel performance
         for l in attn_masks:
             attn_masks[l] = attn_masks[l].contiguous()
 
-        # Convert to block masks
-        make_block_mask = partial(
-            _make_block_mask,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            device=device,
-        )
-        block_masks = {
-            l: make_block_mask(attn_mask) for l, attn_mask in attn_masks.items()
-        }
+        make_bm = partial(_make_block_mask, batch_size=batch_size,
+                          seq_len=seq_len, device=device)
+        block_masks = {l: make_bm(m) for l, m in attn_masks.items()}
 
+        # ── Edge list for simplicial attention (eager, outside compile) ───
+        num_relations = batch["relation_embs"].shape[-2]
+        rel_batch = None
+        if self.has_simplicial:
+            rel_batch = build_rel_batch(
+                f2p_nbr_idxs, f2p_rel_idxs, node_idxs, is_padding,
+                num_relations=num_relations, need_stats=need_stats,
+            )
+
+        # ── Relation stream init ───────────────────────────────────────────
+        r = self.norm_dict["relation"](self.enc_dict["relation"](batch["relation_embs"]))
+        r_mask = batch["r_mask"]
+        if r.dim() == 2:
+            r = r.unsqueeze(0).expand(batch_size, -1, -1).clone()
+            r_mask = r_mask.unsqueeze(0).expand(batch_size, -1)
+        elif r.dim() == 3 and r_mask.dim() == 1:
+            r_mask = r_mask.unsqueeze(0).expand(batch_size, -1)
+        r = r * r_mask[..., None]
+        r_norm_init = r.norm() if need_stats else None
+
+        # ── Cell stream init ───────────────────────────────────────────────
         x = 0
         x = x + (
-            self.norm_dict["col_name"](
-                self.enc_dict["col_name"](batch["col_name_values"])
-            )
+            self.norm_dict["col_name"](self.enc_dict["col_name"](batch["col_name_values"]))
             * (~is_padding)[..., None]
         )
-
         for i, t in enumerate(["number", "text", "datetime", "boolean"]):
             x = x + (
                 self.norm_dict[t](self.enc_dict[t](batch[t + "_values"]))
@@ -259,64 +326,100 @@ class RelationalTransformer(nn.Module):
                 * ((batch["sem_types"] == i) & batch["masks"] & ~is_padding)[..., None]
             )
 
+        # ── Transformer blocks ─────────────────────────────────────────────
+        block_stats = []
         sig_x = None
         for i, block in enumerate(self.blocks):
-            x = block(x, block_masks)
+            x, r, stats_i = block(x, r, block_masks, rel_batch, need_stats=need_stats)
+            if stats_i is not None:
+                block_stats.append(stats_i)
+            # Capture the hidden state after the SIGReg-regularized block
+            # (post-block, pre-final-norm — same point as the SigReg record).
             if self.sigreg is not None and i == self.sigreg_layer:
                 sig_x = x
 
-        # SIGReg auxiliary losses — training-only; skipped at eval so the
-        # projector adds zero inference cost. `sigreg_embed` is the detached
-        # backbone hidden state at the regularized layer, used by main.py for
-        # geometry diagnostics (effective rank / per-dim std) outside compile.
-        if self.sigreg is not None and self.training and sig_x is not None:
-            sigreg_row, sigreg_col, sigreg_stats = self.sigreg(
-                sig_x,
-                node_idxs,
-                table_name_idxs,
-                col_name_idxs,
-                is_padding,
-                use_row=self.sigreg_use_row,
-                use_col=self.sigreg_use_col,
-            )
-            sigreg_embed = sig_x.detach()
-        else:
-            sigreg_row = torch.zeros((), device=device, dtype=torch.float32)
-            sigreg_col = torch.zeros((), device=device, dtype=torch.float32)
-            sigreg_stats = {
-                f"{view}/{key}": sigreg_row
-                for view in ("row", "col")
-                for key in (
-                    "groups_present",
-                    "groups_valid",
-                    "groups_valid_frac",
-                    "group_size_present_mean",
-                    "group_size_valid_mean",
-                    "group_size_valid_max",
-                    "cells_covered_frac",
-                )
-            }
-            sigreg_embed = None
-
         x = self.norm_out(x)
 
-        loss_out = x.new_zeros(())
-        yhat_out = {"number": None, "text": None, "datetime": None, "boolean": None}
+        if return_embeddings:
+            return x
 
-        B, S, _ = x.shape
-        sem_types = batch["sem_types"]  # (B,S) ints 0..3
-        masks = batch["masks"].bool()  # (B,S) where to train
+        # ── Stats for wandb (log steps only — keeps the .unique() sorts and
+        # GPU->CPU syncs off the hot path) ─────────────────────────────────
+        stats = {}
+        if need_stats and rel_batch is not None:
+            r_norm_final = r.norm()
+            nbr_entropies = torch.stack([s["nbr_entropy"] for s in block_stats])
+            rel_entropies = torch.stack([s["rel_entropy"] for s in block_stats])
+            nbr_delta_fracs = torch.stack([s["nbr_delta_frac"] for s in block_stats])
+            rel_delta_fracs = torch.stack([s["rel_delta_frac"] for s in block_stats])
+            nbr_delta_norms = torch.stack([s["nbr_delta_norm"] for s in block_stats])
+            rel_delta_norms = torch.stack([s["rel_delta_norm"] for s in block_stats])
+            valid_nbr_slots = ((f2p_nbr_idxs != -1) & ~is_padding[:, :, None]).sum()
+            valid_rel_slots = ((f2p_rel_idxs != -1) & ~is_padding[:, :, None]).sum()
+            mismatched_fk_rel_slots = (
+                ((f2p_nbr_idxs != -1) ^ (f2p_rel_idxs != -1)) & ~is_padding[:, :, None]
+            ).sum()
+            matched_fk_slots = rel_batch["matched_fk_slots"]
+            valid_fk_slots = rel_batch["valid_fk_slots"]
+            stats = {
+                "simplicial/valid_nbr_slots": valid_nbr_slots,
+                "simplicial/valid_rel_slots": valid_rel_slots,
+                "simplicial/mismatched_fk_rel_slots": mismatched_fk_rel_slots,
+                "simplicial/valid_fk_slots": float(valid_fk_slots),
+                "simplicial/matched_fk_slots": float(matched_fk_slots),
+                "simplicial/parent_match_rate": float(matched_fk_slots)
+                / max(valid_fk_slots, 1),
+                "simplicial/edge_count": float(rel_batch["T"]),
+                "simplicial/r_table_size": float(r.shape[1]),
+                "simplicial/r_norm_init": r_norm_init,
+                "simplicial/r_norm_final": r_norm_final,
+                "simplicial/r_update_frac": r_norm_final / r_norm_init.clamp(min=1e-8),
+                "simplicial/nbr_entropy": nbr_entropies.mean(),
+                "simplicial/rel_entropy": rel_entropies.mean(),
+                "simplicial/nbr_delta_frac": nbr_delta_fracs.mean(),
+                "simplicial/rel_delta_frac": rel_delta_fracs.mean(),
+                "simplicial/nbr_delta_norm": nbr_delta_norms.mean(),
+                "simplicial/rel_delta_norm": rel_delta_norms.mean(),
+            }
+            if rel_batch["T"] > 0:
+                n_active_q = rel_batch["seg_q"].unique().numel()
+                n_active_relation_types = rel_batch["r_t"].unique().numel()
+                n_active_relation_instances = rel_batch["seg_r"].unique().numel()
+                stats["simplicial/active_query_cells"] = float(n_active_q)
+                stats["simplicial/active_relation_types"] = float(n_active_relation_types)
+                stats["simplicial/active_relation_instances"] = float(
+                    n_active_relation_instances
+                )
+                stats["simplicial/edges_per_q"] = float(rel_batch["T"]) / max(n_active_q, 1)
+                stats["simplicial/triples_per_matched_fk_slot"] = float(
+                    rel_batch["T"]
+                ) / max(matched_fk_slots, 1)
+                stats["simplicial/active_relation_type_frac"] = float(
+                    n_active_relation_types
+                ) / max(r.shape[1], 1)
+            else:
+                stats["simplicial/active_query_cells"] = 0.0
+                stats["simplicial/active_relation_types"] = 0.0
+                stats["simplicial/active_relation_instances"] = 0.0
+                stats["simplicial/edges_per_q"] = 0.0
+                stats["simplicial/triples_per_matched_fk_slot"] = 0.0
+                stats["simplicial/active_relation_type_frac"] = 0.0
+
+        # ── Loss ───────────────────────────────────────────────────────────
+        loss_out = x.new_zeros(())
+        yhat_out = {t: None for t in ["number", "text", "datetime", "boolean"]}
+
+        sem_types = batch["sem_types"]
+        masks     = batch["masks"].bool()
 
         for i, t in enumerate(["number", "text", "datetime", "boolean"]):
-            yhat = self.dec_dict[t](x)  # (B,S, D_t)
-            y = batch[f"{t}_values"]  # (B,S, D_y)
-            sem_type_mask = (sem_types == i) & masks  # (B,S) mask for this type
+            yhat = self.dec_dict[t](x)
+            y    = batch[f"{t}_values"]
+            sem_type_mask = (sem_types == i) & masks
 
             if not sem_type_mask.any():
-                if t in yhat_out:
-                    # still touch the param to avoid unused param error
-                    loss_out = loss_out + (yhat.sum() * 0.0)
-                    yhat_out[t] = yhat
+                loss_out = loss_out + (yhat.sum() * 0.0)
+                yhat_out[t] = yhat
                 continue
 
             if t in ("number", "datetime"):
@@ -328,17 +431,35 @@ class RelationalTransformer(nn.Module):
             elif t == "text":
                 raise ValueError("masking text not supported")
 
-            # masked sum for this type
             loss_out = loss_out + (loss_t * sem_type_mask).sum()
-
-            if t in yhat_out:
-                yhat_out[t] = yhat
+            yhat_out[t] = yhat
 
         loss_out = loss_out / masks.sum()
 
-        return loss_out, yhat_out, {
-            "row": sigreg_row,
-            "col": sigreg_col,
-            "embed": sigreg_embed,
-            **sigreg_stats,
-        }
+        # ── SIGReg auxiliary geometry losses (training-only) ────────────────
+        # Row/col views are derived inside SIGReg from node_idxs and the packed
+        # (table, col) key; nothing is pre-split here. All returned values are
+        # 0-dim scalars (main.py logs them via _stat_to_float), and the keys are
+        # always present so every caller can unpack the three-tuple.
+        if self.sigreg is not None and self.training and sig_x is not None:
+            sigreg_row, sigreg_col, sigreg_stats = self.sigreg(
+                sig_x, node_idxs, table_name_idxs, col_name_idxs, is_padding,
+                use_row=self.sigreg_use_row, use_col=self.sigreg_use_col,
+            )
+        else:
+            sigreg_row = x.new_zeros((), dtype=torch.float32)
+            sigreg_col = x.new_zeros((), dtype=torch.float32)
+            sigreg_stats = {
+                f"{view}/{key}": sigreg_row
+                for view in ("row", "col")
+                for key in (
+                    "groups_present", "groups_valid", "groups_valid_frac",
+                    "group_size_present_mean", "group_size_valid_mean",
+                    "group_size_valid_max", "cells_covered_frac",
+                )
+            }
+        stats["sigreg_row"] = sigreg_row
+        stats["sigreg_col"] = sigreg_col
+        stats.update({f"sigreg_{k}": v for k, v in sigreg_stats.items()})
+
+        return loss_out, yhat_out, stats

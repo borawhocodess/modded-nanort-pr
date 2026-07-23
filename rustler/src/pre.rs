@@ -7,7 +7,7 @@ use parquet::file::metadata::ParquetMetaDataReader;
 use polars::prelude::*;
 use rkyv::rancor::Error;
 use serde_json::{self, Value, from_str};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env::var;
 use std::fs;
 use std::hash::{BuildHasherDefault, DefaultHasher};
@@ -28,6 +28,23 @@ pub fn make_column_boolean(df: &mut DataFrame, col_name: &str) -> PolarsResult<(
     let mut mask_series = ca.equal(first).into_series();
     mask_series.rename(col_name.into());
     df.replace(col_name, mask_series)?;
+    Ok(())
+}
+
+fn make_column_boolean_if_present(
+    df: &mut DataFrame,
+    table_name: &str,
+    table_type: &TableType,
+    col_name: &str,
+) -> PolarsResult<()> {
+    if df.column(col_name).is_ok() {
+        make_column_boolean(df, col_name)?;
+    } else {
+        println!(
+            "skipping boolean conversion for missing column {} in {}:{:?}",
+            col_name, table_name, table_type
+        );
+    }
     Ok(())
 }
 
@@ -62,6 +79,23 @@ fn cast_col_to_bool(df: DataFrame, col_name: &str) -> Result<DataFrame, PolarsEr
     df.lazy()
         .with_column(col(col_name).cast(DataType::Boolean).alias(col_name))
         .collect()
+}
+
+fn cast_col_to_bool_if_present(
+    df: DataFrame,
+    table_name: &str,
+    table_type: &TableType,
+    col_name: &str,
+) -> DataFrame {
+    if df.column(col_name).is_ok() {
+        cast_col_to_bool(df, col_name).unwrap()
+    } else {
+        println!(
+            "skipping bool cast for missing column {} in {}:{:?}",
+            col_name, table_name, table_type
+        );
+        df
+    }
 }
 
 pub fn main(cli: Cli) {
@@ -177,7 +211,8 @@ pub fn main(cli: Cli) {
         /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
         //Binarize columns based on first non-null value
         if cli.db_name == "rel-stack" && table_name == "postLinks" {
-            make_column_boolean(&mut df, "LinkTypeId").unwrap();
+            make_column_boolean_if_present(&mut df, &table_name, &table_type, "LinkTypeId")
+                .unwrap();
         }
 
         // if cli.db_name == "rel-stack" && table_name == "badges" {
@@ -185,7 +220,8 @@ pub fn main(cli: Cli) {
 
         // }
         if cli.db_name == "rel-trial" && table_name == "studies" {
-            make_column_boolean(&mut df, "has_dmc").unwrap();
+            make_column_boolean_if_present(&mut df, &table_name, &table_type, "has_dmc")
+                .unwrap();
         }
         // // if cli.db_name == "rel-trial" && table_name == "designs" {
         // //     make_column_boolean(&mut df, "allocation").unwrap();
@@ -196,7 +232,8 @@ pub fn main(cli: Cli) {
 
         if cli.db_name == "rel-trial" && table_name == "eligibilities" {
             for col in ["adult", "child", "older_adult"] {
-                make_column_boolean(&mut df, col).unwrap();
+                make_column_boolean_if_present(&mut df, &table_name, &table_type, col)
+                    .unwrap();
             }
         }
 
@@ -208,10 +245,10 @@ pub fn main(cli: Cli) {
         // amazon
         if cli.db_name == "rel-amazon" {
             if table_name == "user-churn" {
-                df = cast_col_to_bool(df, "churn").unwrap();
+                df = cast_col_to_bool_if_present(df, &table_name, &table_type, "churn");
             }
             if table_name == "item-churn" {
-                df = cast_col_to_bool(df, "churn").unwrap();
+                df = cast_col_to_bool_if_present(df, &table_name, &table_type, "churn");
             }
             if table_name == "product" {
                 df.apply("category", |c| {
@@ -230,34 +267,39 @@ pub fn main(cli: Cli) {
         // stack
         if cli.db_name == "rel-stack" {
             if table_name == "user-engagement" {
-                df = cast_col_to_bool(df, "contribution").unwrap();
+                df = cast_col_to_bool_if_present(df, &table_name, &table_type, "contribution");
             }
             if table_name == "user-badge" {
-                df = cast_col_to_bool(df, "WillGetBadge").unwrap();
+                df = cast_col_to_bool_if_present(df, &table_name, &table_type, "WillGetBadge");
             }
-            if table_name == "posts" {
+            if table_name == "posts" && df.column("AcceptedAnswerId").is_ok() {
                 df = df.drop("AcceptedAnswerId").unwrap();
             }
         }
 
         // trial
         if cli.db_name == "rel-trial" && table_name == "study-outcome" {
-            df = cast_col_to_bool(df, "outcome").unwrap();
+            df = cast_col_to_bool_if_present(df, &table_name, &table_type, "outcome");
         }
 
         // f1
         if cli.db_name == "rel-f1" {
             if table_name == "driver-dnf" {
-                df = cast_col_to_bool(df, "did_not_finish").unwrap();
+                df = cast_col_to_bool_if_present(
+                    df,
+                    &table_name,
+                    &table_type,
+                    "did_not_finish",
+                );
             }
             if table_name == "driver-top3" {
-                df = cast_col_to_bool(df, "qualifying").unwrap();
+                df = cast_col_to_bool_if_present(df, &table_name, &table_type, "qualifying");
             }
         }
 
         // hm
         if cli.db_name == "rel-hm" && table_name == "user-churn" {
-            df = cast_col_to_bool(df, "churn").unwrap();
+            df = cast_col_to_bool_if_present(df, &table_name, &table_type, "churn");
         }
 
         // event
@@ -274,17 +316,17 @@ pub fn main(cli: Cli) {
                 || table_name == "user-attendance"
             {
                 df = df.drop("index").unwrap();
-                df = cast_col_to_bool(df, "target").unwrap();
+                df = cast_col_to_bool_if_present(df, &table_name, &table_type, "target");
             }
         }
 
         // avito
         if cli.db_name == "rel-avito" {
             if table_name == "user-visits" {
-                df = cast_col_to_bool(df, "num_click").unwrap();
+                df = cast_col_to_bool_if_present(df, &table_name, &table_type, "num_click");
             }
             if table_name == "user-clicks" {
-                df = cast_col_to_bool(df, "num_click").unwrap();
+                df = cast_col_to_bool_if_present(df, &table_name, &table_type, "num_click");
             }
         }
 
@@ -405,6 +447,8 @@ pub fn main(cli: Cli) {
     );
     let mut text_to_idx = HashMap::new();
     let mut column_name_to_idx: Vec<(String, i32)> = Vec::new();
+    let mut relation_text_idxs: Vec<i32> = Vec::new();
+    let mut relation_text_idx_seen: HashSet<i32> = HashSet::new();
     let mut node_vec = (0..num_rows_sum)
         .map(|_| Node::default())
         .collect::<Vec<_>>();
@@ -449,6 +493,13 @@ pub fn main(cli: Cli) {
                     .fcol_name_to_ptable_name
                     .get(&col.name().to_string())
                     .unwrap();
+                let relation_text =
+                    format!("{} between {} and {}", col.name(), table.table_name, ptable_name);
+                let l = text_to_idx.len() as i32;
+                let relation_text_idx = *text_to_idx.entry(relation_text).or_insert_with(|| l);
+                if relation_text_idx_seen.insert(relation_text_idx) {
+                    relation_text_idxs.push(relation_text_idx);
+                }
                 let ptable_offset = table_map
                     .get(&(ptable_name.to_string(), TableType::Db))
                     .unwrap_or_else(|| {
@@ -515,6 +566,7 @@ pub fn main(cli: Cli) {
                     let f2p_edge = Edge {
                         node_idx: pnode_idx,
                         table_name_idx: ptable_name_idx,
+                        relation_text_idx,
                         table_type: TableType::Db,
                         timestamp: ptimestamp,
                     };
@@ -523,6 +575,7 @@ pub fn main(cli: Cli) {
                     let p2f_edge = Edge {
                         node_idx,
                         table_name_idx,
+                        relation_text_idx,
                         table_type: table_type.clone(),
                         timestamp,
                     };
@@ -643,6 +696,11 @@ pub fn main(cli: Cli) {
     let file = fs::File::create(format!("{}/column_index.json", pre_path)).unwrap();
     let mut writer = BufWriter::new(file);
     serde_json::to_writer(&mut writer, &column_index).unwrap();
+
+    relation_text_idxs.sort_unstable();
+    let file = fs::File::create(format!("{}/relation_text_idxs.json", pre_path)).unwrap();
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer(&mut writer, &relation_text_idxs).unwrap();
     println!("done in {:?}.", tic.elapsed());
 
     println!("writing out table info...");

@@ -89,13 +89,14 @@ class ValAUROCCallback:
         self.timer = timer
         self._time_to_target: float | None = None  # seconds; set once
 
-    def step(self, step: int, net: torch.nn.Module) -> bool:
-        """Returns True only on the step at which the AUROC target is first reached."""
-        if step != 1 and step % self.eval_every != 0:
-            return False
+    def step(self, step: int, net: torch.nn.Module) -> None:
+        if step % self.eval_every != 0 and step != 1:
+            return
 
         net.eval()
         preds, labels, losses = [], [], []
+        stats_accum = {}
+        stats_count = 0
         with torch.inference_mode():
             for batch in self.val_loader:
                 true_batch_size = batch.pop("true_batch_size")
@@ -105,7 +106,9 @@ class ValAUROCCallback:
                 batch["is_targets"][true_batch_size:, :] = False
                 batch["is_padding"][true_batch_size:, :] = True
 
-                loss, yhat_dict, _ = net(batch)
+                loss, yhat_dict, _stats = net(batch)
+                _accumulate_stats(stats_accum, _stats)
+                stats_count += 1
                 yhat = yhat_dict["boolean"][batch["is_targets"]]
                 y = batch["boolean_values"][batch["is_targets"]].flatten()
 
@@ -125,8 +128,8 @@ class ValAUROCCallback:
             "val/mtp_loss": mtp_loss,
             "val/score_db": float("nan"),
         }
+        log.update(_mean_stats(stats_accum, stats_count, prefix="val/"))
 
-        target_just_reached = False
         if (
             self._time_to_target is None
             and auroc >= self.TARGET_AUROC
@@ -134,7 +137,6 @@ class ValAUROCCallback:
         ):
             self._time_to_target = self.timer.elapsed()
             log["train/time_to_target"] = self._time_to_target
-            target_just_reached = True
             print(
                 f"\n*** TARGET REACHED: auroc={auroc:.4f} "
                 f"time_to_target={self._time_to_target:.1f}s ***"
@@ -146,7 +148,6 @@ class ValAUROCCallback:
             f"  val/mtp_loss={mtp_loss:.4f}"
         )
         net.train()
-        return target_just_reached
 
     def finalize(self, step: int) -> None:
         """Log time_to_target=-1 if the target was never reached."""
@@ -161,57 +162,6 @@ def seed_everything(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def _upload_checkpoint_to_hf(local_path: str, repo_id: str, path_in_repo: str) -> None:
-    """Upload a checkpoint to a HuggingFace model repo (token read from HF_TOKEN env).
-
-    Best-effort: a missing token / lack of write access logs a warning instead of
-    crashing the run, since the target has already been reached by this point.
-    """
-    try:
-        from huggingface_hub import HfApi
-
-        api = HfApi()
-        api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
-        api.upload_file(
-            path_or_fileobj=local_path,
-            path_in_repo=path_in_repo,
-            repo_id=repo_id,
-            repo_type="model",
-        )
-        print(f"uploaded checkpoint to hf://{repo_id}/{path_in_repo}")
-    except Exception as exc:  # noqa: BLE001 — never let upload kill the run
-        print(f"WARNING: HF checkpoint upload to {repo_id}/{path_in_repo} failed: {exc}")
-
-
-@torch.no_grad()
-def geometry_diagnostics(embed: torch.Tensor, is_padding: torch.Tensor):
-    """Backbone geometry metrics at the SIGReg-regularized layer.
-
-    Computed eager (outside torch.compile) over the valid (non-padding) cell
-    embeddings of one training batch.
-
-      * effective_rank — exp(Shannon entropy of the normalized covariance
-        eigenvalues). High = embeddings spread across many dimensions
-        (isotropic); low = collapsed onto a few directions. This is the paper's
-        headline geometry metric (Fig. 1/6): SIGReg should push it *up*.
-      * mean_dim_std — mean per-dimension standard deviation. Higher = the
-        representation uses more of the embedding space; SIGReg pushes it *up*.
-    """
-    x = embed.float()
-    valid = (~is_padding)[..., None].float()           # (B, S, 1)
-    n = valid.sum().clamp(min=1.0)
-    mean = (x * valid).sum(dim=(0, 1)) / n             # (E,)
-    xc = (x - mean) * valid                            # centered, padding zeroed
-    E = x.shape[-1]
-    var = (xc ** 2).sum(dim=(0, 1)) / n                # (E,)
-    mean_dim_std = var.clamp(min=0.0).sqrt().mean().item()
-    cov = (xc.reshape(-1, E).T @ xc.reshape(-1, E)) / n  # (E, E)
-    eig = torch.linalg.eigvalsh(cov).clamp(min=1e-12)
-    p = eig / eig.sum()
-    effective_rank = torch.exp(-(p * p.log()).sum()).item()
-    return effective_rank, mean_dim_std
 
 
 def all_gather_nd(tensor: torch.Tensor) -> list[torch.Tensor]:
@@ -248,6 +198,23 @@ def all_gather_nd(tensor: torch.Tensor) -> list[torch.Tensor]:
     return all_tensors
 
 
+def _stat_to_float(value) -> float:
+    if isinstance(value, torch.Tensor):
+        return value.detach().float().cpu().item()
+    return float(value)
+
+
+def _accumulate_stats(accum: dict[str, float], stats: dict) -> None:
+    for key, value in stats.items():
+        accum[key] = accum.get(key, 0.0) + _stat_to_float(value)
+
+
+def _mean_stats(accum: dict[str, float], count: int, prefix: str = "") -> dict:
+    if count == 0:
+        return {}
+    return {f"{prefix}{key}": value / count for key, value in accum.items()}
+
+
 def main(
     # misc
     project,
@@ -271,6 +238,7 @@ def main(
     lr_schedule,
     max_grad_norm,
     max_steps,
+    lr_total_steps: int | None = None,
     # optimizer selection
     optimizer: str = "adamw",   # "adamw" | "muon"
     muon_lr: float = 5e-3,      # LR for Muon param group (ignored when optimizer="adamw")
@@ -283,6 +251,9 @@ def main(
     d_model=256,
     num_heads=8,
     d_ff=1024,
+    simplicial_layers=None,  # block indices with simplicial attn; None = all
+    update_relations=True,   # False = static relation stream (HGT-style, no RelAttn)
+    qk_norm=True,            # per-head RMSNorm on the trilinear score factors
     # SIGReg: early-layer geometry regularization (sigreg_layer=None disables it)
     sigreg_layer=None,
     sigreg_lambda_row: float = 0.0,
@@ -301,18 +272,7 @@ def main(
     val_eval_freq=None,
     # NanoRT: 45-minute wall-clock budget
     time_budget_minutes=None,
-    # NanoRT: snapshot + HuggingFace upload at the moment the AUROC target is reached
-    hf_ckpt_repo: str | None = None,   # e.g. "GabrielVeloso/NanoRT"; None disables upload
-    hf_ckpt_name: str = "sigreg",      # checkpoint basename → checkpoints/{name}.pt on HF
-    stop_at_target: bool = False,      # end the run as soon as the target is reached
 ):
-    if sigreg_layer is not None and sigreg_layer < 0:
-        sigreg_layer = None
-    if sigreg_lambda_row < 0.0 or sigreg_lambda_col < 0.0:
-        raise ValueError("SIGReg lambdas must be non-negative")
-    if sigreg_lambda_row + sigreg_lambda_col >= 1.0:
-        raise ValueError("SIGReg lambdas must sum to less than 1.0")
-
     seed_everything(seed)
 
     ddp = "LOCAL_RANK" in os.environ
@@ -340,7 +300,7 @@ def main(
     # NanoRT: initialise val AUROC callback (rank 0 only; not DDP-safe)
     val_callback: ValAUROCCallback | None = None
     if val_tasks is not None and rank == 0 and not ddp:
-        _freq = val_eval_freq if val_eval_freq is not None else 100
+        _freq = val_eval_freq if val_eval_freq is not None else max(1, max_steps // 100)
         val_callback = ValAUROCCallback(
             val_tasks=val_tasks,
             batch_size=batch_size,
@@ -407,12 +367,25 @@ def main(
                 in_order=True,
             )
 
+    # SIGReg validation (mirrors the SigReg record run).
+    if sigreg_layer is not None and sigreg_layer < 0:
+        sigreg_layer = None
+    if sigreg_lambda_row < 0.0 or sigreg_lambda_col < 0.0:
+        raise ValueError("SIGReg lambdas must be non-negative")
+    if sigreg_lambda_row + sigreg_lambda_col >= 1.0:
+        raise ValueError("SIGReg lambdas must sum to less than 1.0")
+    if sigreg_lr is not None and sigreg_lr <= 0.0:
+        sigreg_lr = None
+
     net = RelationalTransformer(
         num_blocks=num_blocks,
         d_model=d_model,
         d_text=d_text,
         num_heads=num_heads,
         d_ff=d_ff,
+        simplicial_layers=simplicial_layers,
+        update_relations=update_relations,
+        qk_norm=qk_norm,
         sigreg_layer=sigreg_layer,
         sigreg_n_proj=sigreg_n_proj,
         sigreg_proj_hidden_mult=sigreg_proj_hidden_mult,
@@ -471,11 +444,12 @@ def main(
             adamw_sched = optim.lr_scheduler.OneCycleLR(
                 opt_adamw,
                 max_lr=lr,
-                total_steps=max_steps,
+                total_steps=lr_total_steps if lr_total_steps is not None else max_steps,
                 pct_start=0.2,
                 anneal_strategy="linear",
             )
     else:
+        # SIGReg projector params are trained by a separate fp32 optimizer.
         main_params = [
             p for n, p in net.named_parameters() if not n.startswith("sigreg.")
         ]
@@ -494,12 +468,13 @@ def main(
             lrs = optim.lr_scheduler.OneCycleLR(
                 opt,
                 max_lr=lr,
-                total_steps=max_steps,
+                total_steps=lr_total_steps if lr_total_steps is not None else max_steps,
                 pct_start=0.2,
                 anneal_strategy="linear",
             )
 
     # SIGReg projector — separate fp32 AdamW (kept out of the fused bf16 groups).
+    # Built on the raw net before DDP/compile so net.sigreg.parameters() resolves.
     opt_sigreg = None
     if sigreg_active:
         opt_sigreg = optim.AdamW(
@@ -514,7 +489,7 @@ def main(
     if ddp:
         net = DDP(net)
 
-    net = torch.compile(net, dynamic=False, disable=not compile_)
+    net = torch.compile(net, dynamic=True, disable=not compile_)
 
     steps = 0
     if rank == 0:
@@ -552,6 +527,8 @@ def main(
                 labels = []
                 losses = []
                 eval_load_times = []
+                stats_accum = {}
+                stats_count = 0
                 eval_loader = eval_loaders[(db_name, table_name, split)]
                 pbar = tqdm(
                     total=(
@@ -586,7 +563,10 @@ def main(
                     batch["is_targets"][true_batch_size:, :] = False
                     batch["is_padding"][true_batch_size:, :] = True
 
-                    loss, yhat_dict, _ = net(batch)
+                    loss, yhat_dict, eval_stats = net(batch)
+                    if rank == 0:
+                        _accumulate_stats(stats_accum, eval_stats)
+                        stats_count += 1
 
                     if task_type == "clf":
                         yhat = yhat_dict["boolean"][batch["is_targets"]]
@@ -628,6 +608,11 @@ def main(
                         {
                             k: loss,
                             f"avg_eval_load_time/{db_name}/{table_name}": avg_eval_load_time,
+                            **_mean_stats(
+                                stats_accum,
+                                stats_count,
+                                prefix=f"{split}/{db_name}/{table_name}/",
+                            ),
                         },
                         step=steps,
                     )
@@ -650,14 +635,12 @@ def main(
 
         return metrics
 
-    def checkpoint(best=False, db_name="", table_name="", name=None):
+    def checkpoint(best=False, db_name="", table_name=""):
         if rank != 0:
-            return None
+            return
         save_ckpt_dir_ = Path(save_ckpt_dir).expanduser()
         save_ckpt_dir_.mkdir(parents=True, exist_ok=True)
-        if name is not None:
-            save_ckpt_path = f"{save_ckpt_dir_}/{name}.pt"
-        elif best:
+        if best:
             save_ckpt_path = f"{save_ckpt_dir_}/{db_name}_{table_name}_best.pt"
         else:
             save_ckpt_path = f"{save_ckpt_dir_}/{steps=}.pt"
@@ -665,7 +648,6 @@ def main(
         state_dict = net.module.state_dict() if ddp else net.state_dict()
         torch.save(state_dict, save_ckpt_path)
         print(f"saved checkpoint to {save_ckpt_path}")
-        return save_ckpt_path
 
     def opt_zero_grad():
         if optimizer == "muon":
@@ -733,14 +715,37 @@ def main(
             if rank == 0:
                 wandb.log({"load_time": load_time}, step=steps)
 
-            loss, _yhat_dict, sigreg = net(batch)
-            # SIGReg: L = (1-λc-λr)·L_sup + λc·R_col + λr·R_row  (paper §2.4)
-            lc, lr_ = sigreg_lambda_col, sigreg_lambda_row
-            sup_weighted = (1.0 - lc - lr_) * loss
-            row_weighted = lr_ * sigreg["row"]
-            col_weighted = lc * sigreg["col"]
+            # Stats (entropies, norms, uniques) force extra kernels and
+            # GPU->CPU syncs — only compute them on steps that get logged.
+            # `steps` is incremented after the forward, so mirror the log
+            # condition below with steps + 1.
+            need_stats = (steps + 1 <= 5) or ((steps + 1) % 10 == 0)
+
+            if steps == 0 and compile_:
+                # Warm up torch.compile for both need_stats variants during
+                # step 1, which is excluded from the timer (timer.start()
+                # only fires after the first step completes). Gradients are
+                # discarded, no optimizer step: the training trajectory is
+                # unchanged.
+                for _warm_stats in (True, False):
+                    warm_loss, _, _ = net(batch, need_stats=_warm_stats)
+                    warm_loss.backward()
+                opt_zero_grad()
+
+            loss, _, train_stats = net(batch, need_stats=need_stats)
+            # SIGReg: L = (1-λc-λr)·L_sup + λc·R_col + λr·R_row (paper §2.4).
+            # A single backward updates both the backbone and the projector.
             if sigreg_active:
-                total_loss = sup_weighted + col_weighted + row_weighted
+                row_loss = train_stats.get(
+                    "sigreg_row", loss.new_zeros((), dtype=torch.float32)
+                )
+                col_loss = train_stats.get(
+                    "sigreg_col", loss.new_zeros((), dtype=torch.float32)
+                )
+                sup_weighted = (1.0 - sigreg_lambda_row - sigreg_lambda_col) * loss
+                row_weighted = sigreg_lambda_row * row_loss
+                col_weighted = sigreg_lambda_col * col_loss
+                total_loss = sup_weighted + row_weighted + col_weighted
             else:
                 total_loss = loss
             opt_zero_grad()
@@ -764,35 +769,32 @@ def main(
                     "epochs": steps / len(loader),
                     "grad_norm": grad_norm,
                 }
-                if sigreg_enabled:
-                    if sigreg_lambda_row > 0.0:
-                        log["sigreg/row"] = sigreg["row"].detach().float()
-                        log["loss/sigreg_row_weighted"] = row_weighted.detach().float()
-                    if sigreg_lambda_col > 0.0:
-                        log["sigreg/col"] = sigreg["col"].detach().float()
-                        log["loss/sigreg_col_weighted"] = col_weighted.detach().float()
-                    log["loss/sup_weighted"] = sup_weighted.detach().float()
-                    log["loss/sigreg_weighted"] = (
-                        row_weighted + col_weighted
-                    ).detach().float()
-                    log["loss_total"] = total_loss.detach().float()
-                    for key, value in sigreg.items():
-                        if key.startswith("row/") and sigreg_lambda_row > 0.0:
-                            log[f"sigreg/{key}"] = value.detach().float()
-                        elif key.startswith("col/") and sigreg_lambda_col > 0.0:
-                            log[f"sigreg/{key}"] = value.detach().float()
-                    _diag_every = val_eval_freq if val_eval_freq else 200
-                    if sigreg["embed"] is not None and steps % _diag_every == 0:
-                        erank, mstd = geometry_diagnostics(
-                            sigreg["embed"], batch["is_padding"]
-                        )
-                        log["sigreg/effective_rank"] = erank
-                        log["sigreg/mean_dim_std"] = mstd
                 if optimizer == "muon":
                     log["lr_muon"] = opt_muon.param_groups[0]["lr"]
                     log["lr_adamw"] = opt_adamw.param_groups[0]["lr"]
                 else:
                     log["lr"] = opt.param_groups[0]["lr"]
+                # Log simplicial attention stats early, then periodically.
+                if train_stats and (steps <= 5 or steps % 10 == 0):
+                    flat_train_stats = {
+                        f"train/{k}": _stat_to_float(v)
+                        for k, v in train_stats.items()
+                    }
+                    log.update(flat_train_stats)
+                    if steps <= 5 or steps % 50 == 0:
+                        print(
+                            f"\nstep={steps}  "
+                            f"train/simplicial/edge_count="
+                            f"{flat_train_stats['train/simplicial/edge_count']:.0f}  "
+                            f"parent_match_rate="
+                            f"{flat_train_stats['train/simplicial/parent_match_rate']:.3f}  "
+                            f"active_relation_types="
+                            f"{flat_train_stats['train/simplicial/active_relation_types']:.0f}  "
+                            f"nbr_delta_frac="
+                            f"{flat_train_stats['train/simplicial/nbr_delta_frac']:.3f}  "
+                            f"rel_delta_frac="
+                            f"{flat_train_stats['train/simplicial/rel_delta_frac']:.3f}"
+                        )
                 wandb.log(log, step=steps)
 
             # NanoRT: timer — start on first step, log elapsed, enforce budget
@@ -806,17 +808,7 @@ def main(
 
             # NanoRT: zero-shot AUROC evaluation
             if val_callback is not None and not done:
-                target_just_reached = val_callback.step(steps, net)
-                # On first reaching the target, optionally snapshot the model,
-                # upload it to HuggingFace, and stop the run.
-                if target_just_reached and hf_ckpt_repo:
-                    ckpt_path = checkpoint(name=hf_ckpt_name)
-                    if ckpt_path is not None:
-                        _upload_checkpoint_to_hf(
-                            ckpt_path, hf_ckpt_repo, f"checkpoints/{hf_ckpt_name}.pt"
-                        )
-                if target_just_reached and stop_at_target:
-                    done = True
+                val_callback.step(steps, net)
 
             pbar.update(1)
 

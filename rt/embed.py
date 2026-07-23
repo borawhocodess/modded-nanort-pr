@@ -6,7 +6,6 @@ import strictfire
 import torch
 from ml_dtypes import bfloat16
 from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
 
 
 class TextEmbedder:
@@ -22,13 +21,29 @@ class TextEmbedder:
         self.batch_size = batch_size
 
     def __call__(self, text_list, device=None):
-        return self.model.encode(
-            text_list,
-            batch_size=self.batch_size,
-            convert_to_numpy=True,
-            show_progress_bar=True,
-            device=device,
+        chunks = []
+        n = len(text_list)
+        total_batches = (n + self.batch_size - 1) // self.batch_size
+        print(
+            f"[embed] encoding {n} texts in {total_batches} batches "
+            f"(batch_size={self.batch_size})",
+            flush=True,
         )
+        for start in range(0, n, self.batch_size):
+            end = min(start + self.batch_size, n)
+            batch_i = start // self.batch_size + 1
+            if batch_i == 1 or batch_i % 100 == 0 or batch_i == total_batches:
+                print(f"[embed] batch {batch_i}/{total_batches}", flush=True)
+            chunks.append(
+                self.model.encode(
+                    text_list[start:end],
+                    batch_size=self.batch_size,
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                    device=device,
+                )
+            )
+        return np.concatenate(chunks, axis=0)
 
 
 def main(

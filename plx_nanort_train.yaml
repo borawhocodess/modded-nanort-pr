@@ -15,7 +15,7 @@ inputs:
   - name: hf_artifacts_repo
     description: >
       HuggingFace dataset repo containing the NanoRT artifacts
-      (produced by plx_nanort_build_upload.yaml).
+      (produced by plx_nanort_build_upload_relations_holdout.yaml).
       Example: "franciscogaluppo/nanort-artifacts"
     type: str
     isOptional: false
@@ -33,7 +33,25 @@ inputs:
     description: Log val/auroc_zero_shot every N training steps.
     type: int
     isOptional: true
-    value: 500
+    value: 100
+  - name: max_steps
+    description: Hard step cap; wall-clock budget normally stops first.
+    type: int
+    isOptional: true
+    value: 1000000
+  - name: lr_total_steps
+    description: >
+      OneCycleLR horizon for AdamW. Set to 1000000 when testing with a small
+      max_steps so the LR schedule matches the real competition run.
+      Defaults to max_steps if not set (set to 0 to use max_steps).
+    type: int
+    isOptional: true
+    value: 0
+  - name: time_budget_minutes
+    description: Active training time budget in minutes.
+    type: float
+    isOptional: true
+    value: 45
   - name: batch_size
     description: Training batch size. Increase to improve GPU utilization.
     type: int
@@ -49,62 +67,64 @@ inputs:
     type: float
     isOptional: true
     value: 0.005
+  - name: simplicial_layers
+    description: >
+      Block indices with simplicial attention: "all", "none" or e.g. "0,4,8".
+      Fewer blocks cut step-time linearly.
+    type: str
+    isOptional: true
+    value: all
+  - name: update_relations
+    description: >
+      "1" (default) = dynamic relation stream (RelAttn updates r each block);
+      "0" = static relation operators (HGT-style), r keeps its frozen init r^(0).
+    type: str
+    isOptional: true
+    value: "1"
+  - name: qk_norm
+    description: >
+      "1" (default) = per-head RMSNorm on the trilinear score factors
+      (q, k, kr) to tame logit-variance / entropy collapse; "0" = disable.
+    type: str
+    isOptional: true
+    value: "1"
   - name: sigreg_layer
     description: >
-      Block index to apply SIGReg geometry regularization to (0 = first block,
-      as in the paper). Use -1 to disable SIGReg (baseline).
+      Block index whose cell hidden state is SIGReg-regularized. -1 (default)
+      disables SIGReg, leaving the simplicial-only run.
     type: int
     isOptional: true
     value: -1
   - name: sigreg_lambda_row
-    description: SIGReg row-view (per-node) coefficient λr.
+    description: SIGReg row-view loss coefficient (0 = off).
     type: float
     isOptional: true
     value: 0.0
   - name: sigreg_lambda_col
-    description: SIGReg column-view (per-feature) coefficient λc.
+    description: SIGReg column-view loss coefficient (0 = off; record used col).
     type: float
     isOptional: true
     value: 0.0
   - name: sigreg_n_proj
-    description: Number of random 1-D projection directions per SIGReg view.
+    description: Number of random projections used by SIGReg.
     type: int
     isOptional: true
     value: 64
+  - name: sigreg_lr
+    description: SIGReg projector LR (0 = defaults to the main lr).
+    type: float
+    isOptional: true
+    value: 0.0
   - name: sigreg_min_group
-    description: Minimum valid cells per row/column group used by SIGReg.
+    description: Minimum group size for the SIGReg statistic.
     type: int
     isOptional: true
     value: 8
   - name: sigreg_col_pool
-    description: >
-      Column-view grouping. 1 = pool each (table, col) feature globally across
-      the batch (recommended; large uniform groups). 0 = per-sequence groups
-      (legacy).
+    description: 1 = pool the column view globally across the batch.
     type: int
     isOptional: true
     value: 1
-  - name: hf_ckpt_repo
-    description: >
-      HuggingFace MODEL repo to upload the checkpoint to when the AUROC target is
-      first reached (e.g. "GabrielVeloso/NanoRT"). Empty = no upload.
-      NOTE: requires hf_token with WRITE access to this repo (the download token
-      below is typically read-only).
-    type: str
-    isOptional: true
-    value: ""
-  - name: hf_ckpt_name
-    description: Checkpoint basename; uploaded to checkpoints/<name>.pt on HF.
-    type: str
-    isOptional: true
-    value: sigreg
-  - name: stop_at_target
-    description: >
-      1 = end the run as soon as the AUROC target is reached (snapshot + upload);
-      0 = train for the full 45-minute budget.
-    type: int
-    isOptional: true
-    value: 0
   - name: hf_token
     description: HuggingFace token for higher rate limits on artifact download.
     type: str
@@ -126,24 +146,124 @@ run:
         nvidia.com/gpu: "1"
     command:
       - bash
-      - "-c"
+      - "-lc"
       - |
         exec > >(tee {{ globals.run_outputs_path }}/log.txt) 2>&1
-        set -eu
-        apt-get update && apt-get install -y curl
+        set -euxo pipefail
+        export PYTHONUNBUFFERED=1
+
+        log_step() {
+          echo
+          echo "================================================================"
+          echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
+          echo "================================================================"
+        }
+
+        log_step "Installing system packages"
+        apt-get update && apt-get install -y curl build-essential pkg-config
+
+        log_step "Initializing Polyaxon tracking (best-effort, persists log.txt on failure)"
+        # Register the run early: with set -e a later failure (pixi install,
+        # artifact download, training) would otherwise abort before Polyaxon
+        # captured outputs/log.txt. Kept non-fatal so it never blocks training.
+        if timeout 90 pip3 install --root-user-action ignore polyaxon; then
+          python3 - <<'PY' || echo "WARNING: tracking.init() failed; continuing"
+        from polyaxon import tracking
+        tracking.init()
+        PY
+        else
+          echo "WARNING: pip install polyaxon timed out/failed; continuing"
+        fi
+
+        log_step "Installing pixi"
         curl -fsSL https://pixi.sh/install.sh | sh
         export PATH="$HOME/.pixi/bin:$PATH"
+
+        log_step "Installing pixi environment"
         cd {{ globals.run_artifacts_path }}/uploads
         pixi install
+
+        log_step "Building rustler extension"
         cd rustler && pixi run maturin develop --uv --release && cd ..
+
+        log_step "Installing HuggingFace CLI helpers"
         mkdir -p ~/scratch/pre
         pip3 install --root-user-action ignore polyaxon huggingface_hub hf_transfer
+
+        log_step "Exporting environment variables"
         export WANDB_USER_EMAIL="{{ globals.user_email }}"
-        hf download {{ hf_artifacts_repo }} --repo-type dataset --include "holdout-{{ holdout_db }}/train/*" --local-dir ~/scratch/nanort_artifacts
-        ln -sf ~/scratch/nanort_artifacts/holdout-{{ holdout_db }}/train ~/scratch/pre/nanort-train-{{ holdout_db }}
-        hf download {{ hf_artifacts_repo }} --repo-type dataset --include "holdout-{{ holdout_db }}/val/*" --local-dir ~/scratch/nanort_artifacts
-        ln -sf ~/scratch/nanort_artifacts/holdout-{{ holdout_db }}/val/{{ holdout_db }} ~/scratch/pre/nanort-val-{{ holdout_db }}
-        pixi run python scripts/nanort_train.py --holdout-db {{ holdout_db }} --optimizer {{ optimizer }} --muon-lr {{ muon_lr }} --sigreg-layer {{ sigreg_layer }} --sigreg-lambda-row {{ sigreg_lambda_row }} --sigreg-lambda-col {{ sigreg_lambda_col }} --sigreg-n-proj {{ sigreg_n_proj }} --sigreg-min-group {{ sigreg_min_group }} --sigreg-col-pool {{ sigreg_col_pool }} --hf-ckpt-repo "{{ hf_ckpt_repo }}" --hf-ckpt-name "{{ hf_ckpt_name }}" $( [ "{{ stop_at_target }}" = "1" ] && echo --stop-at-target || true )
+        export HF_HUB_ENABLE_HF_TRANSFER=1
+        set +x
+        if [ -n "${HF_TOKEN:-}" ]; then
+          echo "[hf] token provided"
+        else
+          echo "[hf] token not provided; downloads must be public"
+        fi
+        set -x
+
+        log_step "Downloading ra-holdout-{{ holdout_db }} artifacts"
+        hf download {{ hf_artifacts_repo }} --repo-type dataset --include "ra-holdout-{{ holdout_db }}/train/*" --local-dir ~/scratch/nanort_artifacts
+        hf download {{ hf_artifacts_repo }} --repo-type dataset --include "ra-holdout-{{ holdout_db }}/val/*" --local-dir ~/scratch/nanort_artifacts
+        for DB in $(ls ~/scratch/nanort_artifacts/ra-holdout-{{ holdout_db }}/train/); do
+          ln -sfn ~/scratch/nanort_artifacts/ra-holdout-{{ holdout_db }}/train/$DB ~/scratch/pre/$DB
+        done
+        ln -sfn ~/scratch/nanort_artifacts/ra-holdout-{{ holdout_db }}/val/{{ holdout_db }} ~/scratch/pre/{{ holdout_db }}
+
+        log_step "Checking relation-aware artifacts"
+        pixi run python -u - <<'PY'
+        import json
+        import os
+        from pathlib import Path
+
+        holdout_db = "{{ holdout_db }}"
+        pre = Path.home() / "scratch" / "pre"
+        required = [
+            "table_info.json",
+            "column_index.json",
+            "relation_text_idxs.json",
+            "text_emb_all-MiniLM-L12-v2.bin",
+            "nodes.rkyv",
+            "offsets.rkyv",
+            "p2f_adj.rkyv",
+        ]
+        all_dbs = ["rel-stack", "rel-amazon", "rel-hm", "rel-avito", "rel-trial", "rel-f1"]
+        check_dbs = [db for db in all_dbs if db != holdout_db] + [holdout_db]
+        for artifact_db in check_dbs:
+            path = pre / artifact_db
+            missing = [name for name in required if not (path / name).exists()]
+            if missing:
+                raise FileNotFoundError(
+                    f"{path} is not relation-aware; missing {missing}. "
+                    "Build/upload relation-aware holdout artifacts before "
+                    "running the 45-minute training YAML."
+                )
+            rels = json.load(open(path / "relation_text_idxs.json"))
+            if not rels:
+                raise AssertionError(f"{path}/relation_text_idxs.json is empty")
+            print(
+                f"[artifact-check] {artifact_db}: relation_types={len(rels)} "
+                f"text_emb_size={(path / 'text_emb_all-MiniLM-L12-v2.bin').stat().st_size}",
+                flush=True,
+            )
+        PY
+
+        log_step "Running holdout training (holdout={{ holdout_db }}, optimizer={{ optimizer }}, max_steps={{ max_steps }}, budget={{ time_budget_minutes }}min)"
+        pixi run python -u scripts/nanort_train.py \
+          --holdout-db {{ holdout_db }} \
+          --optimizer {{ optimizer }} \
+          --muon-lr {{ muon_lr }} \
+          --max-steps {{ max_steps }} \
+          --time-budget-minutes {{ time_budget_minutes }} \
+          --sigreg-layer {{ sigreg_layer }} \
+          --sigreg-lambda-row {{ sigreg_lambda_row }} \
+          --sigreg-lambda-col {{ sigreg_lambda_col }} \
+          --sigreg-n-proj {{ sigreg_n_proj }} \
+          --sigreg-lr {{ sigreg_lr }} \
+          --sigreg-min-group {{ sigreg_min_group }} \
+          --sigreg-col-pool {{ sigreg_col_pool }} \
+          $([ "{{ lr_total_steps }}" -gt 0 ] && echo "--lr-total-steps {{ lr_total_steps }}")
+
+        log_step "Done"
     image: "pytorch/pytorch:2.5.0-cuda12.4-cudnn9-devel"
     name: polyaxon-main
     workingDir: "{{ globals.run_artifacts_path }}/uploads"
@@ -166,3 +286,9 @@ run:
         value: "{{ val_eval_freq }}"
       - name: NANORT_BATCH_SIZE
         value: "{{ batch_size }}"
+      - name: NANORT_SIMPLICIAL_LAYERS
+        value: "{{ simplicial_layers }}"
+      - name: NANORT_UPDATE_RELATIONS
+        value: "{{ update_relations }}"
+      - name: NANORT_QK_NORM
+        value: "{{ qk_norm }}"
