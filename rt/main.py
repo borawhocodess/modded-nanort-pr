@@ -485,6 +485,17 @@ def main(
             eps=1e-8,
             fused=False,
         )
+    if rank == 0:
+        n_proj_params = (
+            sum(p.numel() for p in net.sigreg.parameters()) if sigreg_enabled else 0
+        )
+        print(
+            f"[sigreg] enabled={sigreg_enabled} active={sigreg_active} "
+            f"layer={sigreg_layer} lambda_row={sigreg_lambda_row} "
+            f"lambda_col={sigreg_lambda_col} projector_params={n_proj_params:_} "
+            f"opt_sigreg={'yes' if opt_sigreg is not None else 'no'}",
+            flush=True,
+        )
 
     if ddp:
         net = DDP(net)
@@ -727,8 +738,21 @@ def main(
                 # only fires after the first step completes). Gradients are
                 # discarded, no optimizer step: the training trajectory is
                 # unchanged.
+                #
+                # The warm-up backward MUST include the SIGReg term. AOTAutograd
+                # specializes the compiled backward on the outputs that receive
+                # grad in the first backward it sees; warming with the bare
+                # supervised loss bakes in a backward with no projector->backbone
+                # path, so at real steps the SIGReg gradient silently never
+                # reaches the backbone (loss logs fine, AUROC == no-SIGReg).
                 for _warm_stats in (True, False):
-                    warm_loss, _, _ = net(batch, need_stats=_warm_stats)
+                    warm_loss, _, warm_stats = net(batch, need_stats=_warm_stats)
+                    if sigreg_active:
+                        warm_loss = (
+                            (1.0 - sigreg_lambda_row - sigreg_lambda_col) * warm_loss
+                            + sigreg_lambda_row * warm_stats["sigreg_row"]
+                            + sigreg_lambda_col * warm_stats["sigreg_col"]
+                        )
                     warm_loss.backward()
                 opt_zero_grad()
 
