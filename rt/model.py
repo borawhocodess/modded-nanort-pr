@@ -181,6 +181,11 @@ class RelationalTransformer(nn.Module):
         simplicial_layers = set(simplicial_layers)
         assert all(0 <= i < num_blocks for i in simplicial_layers), simplicial_layers
         self.has_simplicial = len(simplicial_layers) > 0
+        # The RelAttn of the LAST simplicial block gets no gradient: its dr
+        # updates r, and no later block consumes that r (only x reaches the head,
+        # r does not). Skip it — dead params otherwise, and the output is
+        # unchanged. `_last_simplicial` is that block index (None if no blocks).
+        _last_simplicial = max(simplicial_layers) if simplicial_layers else None
 
         self.enc_dict = nn.ModuleDict(
             {
@@ -219,7 +224,7 @@ class RelationalTransformer(nn.Module):
                 RelationalBlock(
                     d_model, num_heads, d_ff,
                     use_simplicial=(i in simplicial_layers),
-                    update_relations=update_relations,
+                    update_relations=(update_relations and i != _last_simplicial),
                     qk_norm=qk_norm,
                 )
                 for i in range(num_blocks)
