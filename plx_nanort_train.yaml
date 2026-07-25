@@ -159,36 +159,28 @@ run:
           echo "================================================================"
         }
 
-        log_step "Installing system packages"
-        apt-get update && apt-get install -y curl build-essential pkg-config
+        # NOTE: apt packages, pixi, polyaxon and the HF helpers are all baked
+        # into the image (gabrielmveloso/nanort). This block only registers the
+        # run, re-links the pixi env from the warm cache, and builds rustler.
 
-        log_step "Initializing Polyaxon tracking (best-effort, persists log.txt on failure)"
-        # Register the run early: with set -e a later failure (pixi install,
-        # artifact download, training) would otherwise abort before Polyaxon
-        # captured outputs/log.txt. Kept non-fatal so it never blocks training.
-        if timeout 90 pip3 install --root-user-action ignore polyaxon; then
-          python3 - <<'PY' || echo "WARNING: tracking.init() failed; continuing"
+        log_step "Initializing Polyaxon tracking (best-effort; polyaxon prebaked)"
+        # polyaxon is already installed in the image; just register the run early
+        # so outputs/log.txt persists even if a later step fails (set -e).
+        python3 - <<'PY' || echo "WARNING: tracking.init() failed; continuing"
         from polyaxon import tracking
         tracking.init()
         PY
-        else
-          echo "WARNING: pip install polyaxon timed out/failed; continuing"
-        fi
 
-        log_step "Installing pixi"
-        curl -fsSL https://pixi.sh/install.sh | sh
+        log_step "Installing pixi environment (fast: re-link from prebaked cache)"
         export PATH="$HOME/.pixi/bin:$PATH"
-
-        log_step "Installing pixi environment"
         cd {{ globals.run_artifacts_path }}/uploads
-        pixi install
+        pixi install --locked
 
-        log_step "Building rustler extension"
+        log_step "Building rustler extension (crates prefetched)"
         cd rustler && pixi run maturin develop --uv --release && cd ..
 
-        log_step "Installing HuggingFace CLI helpers"
+        log_step "Preparing scratch dir"
         mkdir -p ~/scratch/pre
-        pip3 install --root-user-action ignore polyaxon huggingface_hub hf_transfer
 
         log_step "Exporting environment variables"
         export WANDB_USER_EMAIL="{{ globals.user_email }}"
@@ -264,7 +256,7 @@ run:
           $([ "{{ lr_total_steps }}" -gt 0 ] && echo "--lr-total-steps {{ lr_total_steps }}")
 
         log_step "Done"
-    image: "pytorch/pytorch:2.5.0-cuda12.4-cudnn9-devel"
+    image: "gabrielmveloso/nanort:cu124-torch2.6"
     name: polyaxon-main
     workingDir: "{{ globals.run_artifacts_path }}/uploads"
     env:
