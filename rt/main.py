@@ -14,6 +14,9 @@ from torch.nn.utils import clip_grads_with_norm_, get_total_norm
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from dataclasses import asdict
+
+from rt.config import TrainConfig
 from rt.data import RelationalDataset
 from rt.model import RelationalTransformer
 from rt.optim import Muon, build_muon_param_groups
@@ -63,6 +66,8 @@ class ValAUROCCallback:
         device,
         eval_every: int,
         timer: TrainTimer | None = None,
+        eval_at_step1: bool = True,
+        save_ckpt_dir: str | None = None,
     ):
         val_dataset = RelationalDataset(
             tasks=val_tasks,
@@ -88,9 +93,18 @@ class ValAUROCCallback:
         self.eval_every = eval_every
         self.timer = timer
         self._time_to_target: float | None = None  # seconds; set once
+        # Skip the step-1 eval when False: on the static-relation route the
+        # near-init auroc is high (~0.87) and would trigger time_to_target at
+        # step 1, which is not a trained-model crossing. Skipping it makes the
+        # metric reflect a real checkpoint.
+        self.eval_at_step1 = eval_at_step1
+        # Save the best-by-zero-shot-auroc checkpoint. The auroc peaks early and
+        # decays, so the budget-end checkpoint is NOT the best one to keep.
+        self.save_ckpt_dir = save_ckpt_dir
+        self.best_auroc = -float("inf")
 
     def step(self, step: int, net: torch.nn.Module) -> None:
-        if step % self.eval_every != 0 and step != 1:
+        if step % self.eval_every != 0 and not (step == 1 and self.eval_at_step1):
             return
 
         net.eval()
@@ -141,6 +155,13 @@ class ValAUROCCallback:
                 f"\n*** TARGET REACHED: auroc={auroc:.4f} "
                 f"time_to_target={self._time_to_target:.1f}s ***"
             )
+
+        if self.save_ckpt_dir is not None and auroc > self.best_auroc:
+            self.best_auroc = auroc
+            ckpt_dir = Path(self.save_ckpt_dir).expanduser()
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(net.state_dict(), ckpt_dir / "best.pt")
+            print(f"\n[ckpt] new best auroc={auroc:.4f} @ step={step} -> {ckpt_dir}/best.pt")
 
         wandb.log(log, step=step)
         print(
@@ -215,64 +236,60 @@ def _mean_stats(accum: dict[str, float], count: int, prefix: str = "") -> dict:
     return {f"{prefix}{key}": value / count for key, value in accum.items()}
 
 
-def main(
-    # misc
-    project,
-    eval_splits,
-    eval_freq,
-    eval_pow2,
-    max_eval_steps,
-    load_ckpt_path,
-    save_ckpt_dir,
-    compile_,
-    seed,
-    # data
-    train_tasks,
-    eval_tasks,
-    batch_size,
-    num_workers,
-    max_bfs_width,
-    # optimization
-    lr,
-    wd,
-    lr_schedule,
-    max_grad_norm,
-    max_steps,
-    lr_total_steps: int | None = None,
-    # optimizer selection
-    optimizer: str = "adamw",   # "adamw" | "muon"
-    muon_lr: float = 5e-3,      # LR for Muon param group (ignored when optimizer="adamw")
-    muon_warmup_steps: int = 200,
-    # model
-    embedding_model="all-MiniLM-L12-v2",
-    d_text=384,
-    seq_len=1024,
-    num_blocks=12,
-    d_model=256,
-    num_heads=8,
-    d_ff=1024,
-    simplicial_layers=None,  # block indices with simplicial attn; None = all
-    update_relations=True,   # False = static relation stream (HGT-style, no RelAttn)
-    qk_norm=True,            # per-head RMSNorm on the trilinear score factors
-    # SIGReg: early-layer geometry regularization (sigreg_layer=None disables it)
-    sigreg_layer=None,
-    sigreg_lambda_row: float = 0.0,
-    sigreg_lambda_col: float = 0.0,
-    sigreg_lr: float | None = None,   # projector LR (defaults to `lr`)
-    sigreg_n_proj: int = 64,
-    sigreg_proj_hidden_mult: int = 4,
-    sigreg_proj_out_div: int = 4,
-    sigreg_proj_hidden_layers: int = 1,
-    sigreg_knots: int = 17,
-    sigreg_t_max: float = 3.0,
-    sigreg_min_group: int = 8,
-    sigreg_col_global_pool: bool = True,
-    # NanoRT: zero-shot AUROC evaluation on fixed val artifact
-    val_tasks=None,
-    val_eval_freq=None,
-    # NanoRT: 45-minute wall-clock budget
-    time_budget_minutes=None,
-):
+def main(cfg: TrainConfig):
+    # Single config object (rt/config.py) is the only entry point — no CLI.
+    # Unpacked into locals here so the body below reads with bare names.
+    project = cfg.project
+    eval_splits = cfg.eval_splits
+    eval_freq = cfg.eval_freq
+    eval_pow2 = cfg.eval_pow2
+    max_eval_steps = cfg.max_eval_steps
+    load_ckpt_path = cfg.load_ckpt_path
+    save_ckpt_dir = cfg.save_ckpt_dir
+    compile_ = cfg.compile_
+    seed = cfg.seed
+    train_tasks = cfg.train_tasks
+    eval_tasks = cfg.eval_tasks
+    batch_size = cfg.batch_size
+    num_workers = cfg.num_workers
+    max_bfs_width = cfg.max_bfs_width
+    lr = cfg.lr
+    wd = cfg.wd
+    lr_schedule = cfg.lr_schedule
+    max_grad_norm = cfg.max_grad_norm
+    max_steps = cfg.max_steps
+    lr_total_steps = cfg.lr_total_steps
+    optimizer = cfg.optimizer
+    muon_lr = cfg.muon_lr
+    muon_warmup_steps = cfg.muon_warmup_steps
+    embedding_model = cfg.embedding_model
+    d_text = cfg.d_text
+    seq_len = cfg.seq_len
+    num_blocks = cfg.num_blocks
+    d_model = cfg.d_model
+    num_heads = cfg.num_heads
+    d_ff = cfg.d_ff
+    simplicial_layers = cfg.simplicial_layers
+    update_relations = cfg.update_relations
+    qk_norm = cfg.qk_norm
+    simplicial_layerscale_init = cfg.simplicial_layerscale_init
+    sigreg_layer = cfg.sigreg_layer
+    sigreg_lambda_row = cfg.sigreg_lambda_row
+    sigreg_lambda_col = cfg.sigreg_lambda_col
+    sigreg_lr = cfg.sigreg_lr
+    sigreg_n_proj = cfg.sigreg_n_proj
+    sigreg_proj_hidden_mult = cfg.sigreg_proj_hidden_mult
+    sigreg_proj_out_div = cfg.sigreg_proj_out_div
+    sigreg_proj_hidden_layers = cfg.sigreg_proj_hidden_layers
+    sigreg_knots = cfg.sigreg_knots
+    sigreg_t_max = cfg.sigreg_t_max
+    sigreg_min_group = cfg.sigreg_min_group
+    sigreg_col_global_pool = cfg.sigreg_col_global_pool
+    val_tasks = cfg.val_tasks
+    val_eval_freq = cfg.val_eval_freq
+    time_budget_minutes = cfg.time_budget_minutes
+    eval_at_step1 = cfg.eval_at_step1
+
     seed_everything(seed)
 
     ddp = "LOCAL_RANK" in os.environ
@@ -289,7 +306,7 @@ def main(
         world_size = 1
 
     if rank == 0:
-        run = wandb.init(project=project, config=locals(), tags=["nanort"])
+        run = wandb.init(project=project, config=asdict(cfg), tags=["nanort"])
         print(run.name)
 
     # NanoRT: initialise 45-minute training timer
@@ -299,7 +316,7 @@ def main(
 
     # NanoRT: initialise val AUROC callback (rank 0 only; not DDP-safe)
     val_callback: ValAUROCCallback | None = None
-    if val_tasks is not None and rank == 0 and not ddp:
+    if val_tasks and rank == 0 and not ddp:
         _freq = val_eval_freq if val_eval_freq is not None else max(1, max_steps // 100)
         val_callback = ValAUROCCallback(
             val_tasks=val_tasks,
@@ -312,6 +329,8 @@ def main(
             device="cuda",
             eval_every=_freq,
             timer=timer,
+            eval_at_step1=eval_at_step1,
+            save_ckpt_dir=save_ckpt_dir,
         )
 
     torch.multiprocessing.set_sharing_strategy("file_system")
@@ -386,6 +405,7 @@ def main(
         simplicial_layers=simplicial_layers,
         update_relations=update_relations,
         qk_norm=qk_norm,
+        simplicial_layerscale_init=simplicial_layerscale_init,
         sigreg_layer=sigreg_layer,
         sigreg_n_proj=sigreg_n_proj,
         sigreg_proj_hidden_mult=sigreg_proj_hidden_mult,
@@ -805,7 +825,11 @@ def main(
                         for k, v in train_stats.items()
                     }
                     log.update(flat_train_stats)
-                    if steps <= 5 or steps % 50 == 0:
+                    # simplicial/* keys are absent when the simplicial path is
+                    # disabled (simplicial_layers=none) — guard so that control
+                    # run doesn't KeyError at the first log step.
+                    if (steps <= 5 or steps % 50 == 0) and \
+                            "train/simplicial/edge_count" in flat_train_stats:
                         print(
                             f"\nstep={steps}  "
                             f"train/simplicial/edge_count="

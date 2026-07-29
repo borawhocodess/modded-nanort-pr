@@ -1,8 +1,9 @@
+from rt.config import TrainConfig
 from rt.main import main
 from rt.tasks import all_tasks, forecast_tasks
 
 if __name__ == "__main__":
-    main(
+    main(TrainConfig(
         # misc
         project="rt",
         eval_splits=["val", "test"],
@@ -20,11 +21,13 @@ if __name__ == "__main__":
         num_workers=8,
         max_bfs_width=256,
         # optimization
+        optimizer="adamw",
         lr=1e-3,
         wd=0.1,
         lr_schedule=True,
         max_grad_norm=1.0,
         max_steps=50_001,
+        time_budget_minutes=None,
         # model
         embedding_model="all-MiniLM-L12-v2",
         d_text=384,
@@ -33,4 +36,4 @@ if __name__ == "__main__":
         d_model=256,
         num_heads=8,
         d_ff=1024,
-    )
+    ))

@@ -67,7 +67,7 @@ class FFN(nn.Module):
 
 class RelationalBlock(nn.Module):
     def __init__(self, d_model, num_heads, d_ff, use_simplicial=True,
-                 update_relations=True, qk_norm=True):
+                 update_relations=True, qk_norm=True, layerscale_init=1.0):
         super().__init__()
 
         norm_names = ["feat", "col", "full", "ffn"]
@@ -84,8 +84,15 @@ class RelationalBlock(nn.Module):
         self.update_relations = update_relations and use_simplicial
         if use_simplicial:
             self.nbr_attn = SimplicialNbrAttn(d_model, num_heads, qk_norm=qk_norm)
+            # LayerScale (CaiT-style) on the trilinear deltas. Per-channel learnable
+            # gate: with a small init the cell/relation streams start from their
+            # text-derived / attention-derived priors and the optimizer decides how
+            # much relational context to fold in. init=1.0 recovers the plain
+            # residual. gradient still flows to the attn params whenever init != 0.
+            self.nbr_scale = nn.Parameter(torch.full((d_model,), layerscale_init))
             if self.update_relations:
                 self.rel_attn = RelAttn(d_model, num_heads, qk_norm=qk_norm)
+                self.rel_scale = nn.Parameter(torch.full((d_model,), layerscale_init))
         self.ffn = FFN(d_model, d_ff)
 
     def forward(self, x, r, block_masks, rel_batch, need_stats=False):
@@ -98,8 +105,10 @@ class RelationalBlock(nn.Module):
             r_n = self.norms["nbr_r"](r)
 
             dx, nbr_entropy = self.nbr_attn(x_n, r_n, rel_batch, need_stats=need_stats)
+            dx = dx * self.nbr_scale
             if self.update_relations:
                 dr, rel_entropy = self.rel_attn(r_n, x_n, rel_batch, need_stats=need_stats)
+                dr = dr * self.rel_scale
             else:
                 dr, rel_entropy = None, (x.new_zeros(()) if need_stats else None)
             if need_stats:
@@ -149,7 +158,7 @@ def _make_block_mask(mask, batch_size, seq_len, device):
 class RelationalTransformer(nn.Module):
     def __init__(
         self, num_blocks, d_model, d_text, num_heads, d_ff, simplicial_layers=None,
-        update_relations=True, qk_norm=True,
+        update_relations=True, qk_norm=True, simplicial_layerscale_init=1.0,
         # SIGReg: early-layer geometry regularization (None = disabled).
         sigreg_layer=None,
         sigreg_n_proj=64,
@@ -170,6 +179,9 @@ class RelationalTransformer(nn.Module):
         ``update_relations``: when False the relation stream stays static
         (HGT-style) — RelAttn is dropped and r keeps its frozen init r^(0).
         ``qk_norm``: per-head RMSNorm on the trilinear score factors.
+        ``simplicial_layerscale_init``: per-channel LayerScale init on the
+        SimplicialNbrAttn/RelAttn deltas (1.0 = plain residual; <1 starts the
+        streams closer to their text/attention priors).
 
         ``sigreg_layer``: block index whose (post-block, pre-final-norm) cell
         hidden state is geometry-regularized by SIGReg. None disables SIGReg;
@@ -226,6 +238,7 @@ class RelationalTransformer(nn.Module):
                     use_simplicial=(i in simplicial_layers),
                     update_relations=(update_relations and i != _last_simplicial),
                     qk_norm=qk_norm,
+                    layerscale_init=simplicial_layerscale_init,
                 )
                 for i in range(num_blocks)
             ]
@@ -336,6 +349,13 @@ class RelationalTransformer(nn.Module):
         sig_x = None
         for i, block in enumerate(self.blocks):
             x, r, stats_i = block(x, r, block_masks, rel_batch, need_stats=need_stats)
+            # Defensive re-mask: RelAttn only scatters into real edges, and every
+            # projection is bias-free, so padding relations *should* stay 0 — but
+            # the relation encoder has a bias, so the invariant hinges entirely on
+            # this multiply. Reapply it after each update so padding slots can never
+            # leak a non-zero r into the next block.
+            if self.has_simplicial:
+                r = r * r_mask[..., None]
             if stats_i is not None:
                 block_stats.append(stats_i)
             # Capture the hidden state after the SIGReg-regularized block

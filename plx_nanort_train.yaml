@@ -67,6 +67,20 @@ inputs:
     type: float
     isOptional: true
     value: 0.005
+  - name: lr
+    description: >
+      AdamW group learning rate (encoders, norms, relation encoder, biases).
+      Lower it to "hold" a strong init on the static-relation route.
+    type: float
+    isOptional: true
+    value: 0.001
+  - name: muon_warmup_steps
+    description: >
+      Muon LR warmup steps. Longer warmup keeps early updates small, which can
+      preserve a strong step-1 init before the schedule ramps up.
+    type: int
+    isOptional: true
+    value: 200
   - name: simplicial_layers
     description: >
       Block indices with simplicial attention: "all", "none" or e.g. "0,4,8".
@@ -88,6 +102,15 @@ inputs:
     type: str
     isOptional: true
     value: "1"
+  - name: simplicial_layerscale_init
+    description: >
+      LayerScale init on the SimplicialNbrAttn/RelAttn deltas. "1.0" (default)
+      = plain residual (record baseline); values <1 (e.g. 0.1) start the
+      cell/relation streams closer to their text/attention priors and let the
+      optimizer fold in relational context gradually.
+    type: float
+    isOptional: true
+    value: 1.0
   - name: sigreg_layer
     description: >
       Block index whose cell hidden state is SIGReg-regularized. -1 (default)
@@ -125,6 +148,28 @@ inputs:
     type: int
     isOptional: true
     value: 1
+  - name: hf_checkpoint_repo
+    description: HuggingFace repo where the best checkpoint is uploaded (empty = no upload).
+    type: str
+    isOptional: true
+    value: ""
+  - name: hf_checkpoint_repo_type
+    description: HuggingFace repo type for checkpoint upload.
+    type: str
+    isOptional: true
+    value: model
+  - name: checkpoint_prefix
+    description: Prefix used for the checkpoint folder on HuggingFace.
+    type: str
+    isOptional: true
+    value: nanort-simplicial-staticrel
+  - name: eval_at_step1
+    description: >
+      "1" (default) evaluates val auroc at step 1. Set "0" to skip it so
+      time_to_target reflects a real trained checkpoint, not the near-init spike.
+    type: str
+    isOptional: true
+    value: "1"
   - name: hf_token
     description: HuggingFace token for higher rate limits on artifact download.
     type: str
@@ -239,21 +284,34 @@ run:
             )
         PY
 
+        CKPT_DIR="ckpts/{{ checkpoint_prefix }}-{{ holdout_db }}-{{ optimizer }}-s{{ seed }}"
+        RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-${RANDOM}"
+        HF_CKPT_PATH="checkpoints/{{ holdout_db }}/{{ checkpoint_prefix }}/seed-{{ seed }}-${RUN_ID}"
+        export NANORT_SAVE_CKPT_DIR="$CKPT_DIR"
+
         log_step "Running holdout training (holdout={{ holdout_db }}, optimizer={{ optimizer }}, max_steps={{ max_steps }}, budget={{ time_budget_minutes }}min)"
-        pixi run python -u scripts/nanort_train.py \
-          --holdout-db {{ holdout_db }} \
-          --optimizer {{ optimizer }} \
-          --muon-lr {{ muon_lr }} \
-          --max-steps {{ max_steps }} \
-          --time-budget-minutes {{ time_budget_minutes }} \
-          --sigreg-layer {{ sigreg_layer }} \
-          --sigreg-lambda-row {{ sigreg_lambda_row }} \
-          --sigreg-lambda-col {{ sigreg_lambda_col }} \
-          --sigreg-n-proj {{ sigreg_n_proj }} \
-          --sigreg-lr {{ sigreg_lr }} \
-          --sigreg-min-group {{ sigreg_min_group }} \
-          --sigreg-col-pool {{ sigreg_col_pool }} \
-          $([ "{{ lr_total_steps }}" -gt 0 ] && echo "--lr-total-steps {{ lr_total_steps }}")
+        pixi run python -u scripts/nanort_train.py
+
+        if [ -n "{{ hf_checkpoint_repo }}" ]; then
+          log_step "Uploading best checkpoint to HF ({{ hf_checkpoint_repo }}:$HF_CKPT_PATH)"
+          cat > "$CKPT_DIR/metadata.json" <<EOF
+        {
+          "holdout_db": "{{ holdout_db }}",
+          "optimizer": "{{ optimizer }}",
+          "muon_lr": {{ muon_lr }},
+          "muon_warmup_steps": {{ muon_warmup_steps }},
+          "update_relations": "{{ update_relations }}",
+          "simplicial_layers": "{{ simplicial_layers }}",
+          "seed": {{ seed }},
+          "hf_checkpoint_path": "$HF_CKPT_PATH"
+        }
+        EOF
+          find "$CKPT_DIR" -maxdepth 2 -type f | sort | tee {{ globals.run_outputs_path }}/checkpoint_manifest.txt
+          printf "%s\n" "$HF_CKPT_PATH" > {{ globals.run_outputs_path }}/hf_checkpoint_path.txt
+          hf upload {{ hf_checkpoint_repo }} "$CKPT_DIR" "$HF_CKPT_PATH" --repo-type {{ hf_checkpoint_repo_type }}
+        else
+          log_step "hf_checkpoint_repo empty — skipping HF upload"
+        fi
 
         log_step "Done"
     image: "gabrielmveloso/nanort:cu124-torch2.6"
@@ -284,3 +342,37 @@ run:
         value: "{{ update_relations }}"
       - name: NANORT_QK_NORM
         value: "{{ qk_norm }}"
+      - name: NANORT_SIMPLICIAL_LAYERSCALE_INIT
+        value: "{{ simplicial_layerscale_init }}"
+      - name: NANORT_LR
+        value: "{{ lr }}"
+      - name: NANORT_MUON_WARMUP_STEPS
+        value: "{{ muon_warmup_steps }}"
+      - name: NANORT_EVAL_AT_STEP1
+        value: "{{ eval_at_step1 }}"
+      - name: NANORT_HOLDOUT_DB
+        value: "{{ holdout_db }}"
+      - name: NANORT_OPTIMIZER
+        value: "{{ optimizer }}"
+      - name: NANORT_MUON_LR
+        value: "{{ muon_lr }}"
+      - name: NANORT_MAX_STEPS
+        value: "{{ max_steps }}"
+      - name: NANORT_LR_TOTAL_STEPS
+        value: "{{ lr_total_steps }}"
+      - name: NANORT_TIME_BUDGET_MINUTES
+        value: "{{ time_budget_minutes }}"
+      - name: NANORT_SIGREG_LAYER
+        value: "{{ sigreg_layer }}"
+      - name: NANORT_SIGREG_LAMBDA_ROW
+        value: "{{ sigreg_lambda_row }}"
+      - name: NANORT_SIGREG_LAMBDA_COL
+        value: "{{ sigreg_lambda_col }}"
+      - name: NANORT_SIGREG_N_PROJ
+        value: "{{ sigreg_n_proj }}"
+      - name: NANORT_SIGREG_LR
+        value: "{{ sigreg_lr }}"
+      - name: NANORT_SIGREG_MIN_GROUP
+        value: "{{ sigreg_min_group }}"
+      - name: NANORT_SIGREG_COL_POOL
+        value: "{{ sigreg_col_pool }}"
