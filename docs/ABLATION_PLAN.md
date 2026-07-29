@@ -135,20 +135,41 @@ speedrun*, para manter comparabilidade com os records 2 e 3.
 
 Gate para todo o resto. Custo: quase todo em código.
 
-**0.1 — Decompor o AUROC pooled.** ~40 linhas em `ValAUROCCallback`. O id de tarefa já
-está no batch: `col_name_idxs[is_targets]` (9 vs 3246415) ou `table_name_idxs[is_targets]`.
-Logar por eval:
+**0.1 — Decompor o AUROC pooled. ✅ IMPLEMENTADO** ([rt/val_metrics.py](../rt/val_metrics.py),
+ligado em [main.py:161](../rt/main.py#L161); testes em
+[tests/test_val_metrics.py](../tests/test_val_metrics.py), rodam sem torch/GPU).
 
-- `val/auroc_pooled` (atual, mantido)
-- `val/auroc/<task>` e `val/auroc_mean_per_task` ← **primária**
+O id de tarefa já estava no batch: `col_name_idxs[is_targets]` (9 = `num_click of
+user-clicks`, 3246415 = `num_click of user-visits`), mapeado por `get_column_index`. Zero
+plumbing novo. Logado por eval:
+
+- `val/auroc_zero_shot` — pooled, **intocado**: é contra ele que os records e o
+  `time_to_target` são medidos
+- `val/auroc/<task>` e `val/auroc_mean_per_task` ← **primária** (a métrica do README)
 - `val/base_rate/<task>`, `val/n_pos/<task>`, `val/n_neg/<task>`
-- `val/auroc_between` — a fórmula fechada acima, o teto de base-rate puro
+- `val/auroc_between` — fórmula fechada acima, teto de base-rate puro
+- `val/auroc_pooled_within`, `val/auroc_pooled_cross`, `val/pooled_cross_weight` —
+  split **exato** do pooled: como AUROC é uma média de Mann-Whitney sobre pares
+  (positivo, negativo), ela fatora sobre a tarefa de origem de cada elemento, e vale a
+  identidade `pooled = (1−cw)·within + cw·cross` (verificada no teste a 1e-9).
+  `cross_weight` é a fração da métrica reportada que repousa em pares **entre** tarefas —
+  comparações que o benchmark nunca pede. Nas contagens de val do avito, `cw ≈ 0.72`.
 - `val/pred_tie_frac`, `val/pred_unique` — piso de ruído do bf16
-- `val/auroc_within_pooled` — pooled após centrar os scores por tarefa (remove o offset entre-tarefas)
+- `val/n_tasks`, `val/n_unmapped_tasks` — se o mapa de id falhar, o split continua
+  correto (agrupa pelo id observado), só sem nome resolvido
 
-Custo GPU: um eval. **Gate G0**: se `auroc_mean_per_task ≪ auroc_pooled ≈ auroc_between`,
-o "0.87 zero-shot" é separação de base rate e as Fases 2–4 mudam de objeto — passam a
-medir efeito sobre `auroc_mean_per_task`, que pode estar em ~0.5.
+Descartado no caminho: a primeira versão logava "pooled após centrar os scores por
+tarefa". Centrar pela média do grupo **não** remove o efeito de base rate — a média do
+grupo depende dela, e o resultado ficou 0.70 contra 0.86 de `mean_per_task` num fixture
+onde o sinal intra-tarefa era idêntico nos dois grupos. Sem interpretação; substituído
+pelo split exato de Mann-Whitney.
+
+Custo GPU: um eval. **Gate G0**: se `auroc_mean_per_task ≪ auroc_zero_shot ≈
+auroc_between`, o "0.87 zero-shot" é separação de base rate e as Fases 2–4 mudam de
+objeto — passam a medir efeito sobre `auroc_mean_per_task`, que pode estar em ~0.5.
+
+Como obter a leitura sem gastar 45 min: `eval_at_step1=1` (default do YAML) + `max_steps`
+pequeno já entrega a decomposição no step 1, que é ~init.
 
 **0.2 — `AUROC@0` e sua distribuição sobre seeds.** Uma linha para habilitar
 (`val_callback.step(0, net)` antes do loop de treino; `0 % eval_every == 0` já passa o

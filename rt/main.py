@@ -17,9 +17,10 @@ from tqdm.auto import tqdm
 from dataclasses import asdict
 
 from rt.config import TrainConfig
-from rt.data import RelationalDataset
+from rt.data import RelationalDataset, get_column_index
 from rt.model import RelationalTransformer
 from rt.optim import Muon, build_muon_param_groups
+from rt.val_metrics import decompose_val_auroc
 
 
 # NanoRT: 45-minute wall-clock training timer ──────────────────────────────────
@@ -89,6 +90,15 @@ class ValAUROCCallback:
             pin_memory=True,
             in_order=True,
         )
+        # Target-cell column index -> task name, for the per-task AUROC split.
+        # Each val sequence has exactly one target cell, and its col_name_idxs
+        # entry is the text index of the target column — the same index
+        # get_column_index resolves — so the batch already carries the task id.
+        self.task_names = {
+            get_column_index(target_column, table_name, db_name):
+                f"{table_name}/{target_column}"
+            for db_name, table_name, target_column, _split, _drop in val_tasks
+        }
         self.device = device
         self.eval_every = eval_every
         self.timer = timer
@@ -108,7 +118,7 @@ class ValAUROCCallback:
             return
 
         net.eval()
-        preds, labels, losses = [], [], []
+        preds, labels, task_ids, losses = [], [], [], []
         stats_accum = {}
         stats_count = 0
         with torch.inference_mode():
@@ -129,19 +139,28 @@ class ValAUROCCallback:
                 losses.append(loss.item())
                 preds.append(yhat.flatten())
                 labels.append(y)
+                task_ids.append(batch["col_name_idxs"][batch["is_targets"]])
 
         preds_np = torch.cat(preds).float().cpu().numpy()
         labels_np = torch.cat(labels).float().cpu().numpy()
         labels_bin = [int(x > 0) for x in labels_np]
+        task_ids_np = torch.cat(task_ids).cpu().numpy()
 
         auroc = roc_auc_score(labels_bin, preds_np)
         mtp_loss = sum(losses) / len(losses)
 
+        # auroc_zero_shot pools all val tasks into one number and is kept as-is:
+        # it is what the record history and time_to_target are measured against.
+        # The decomposition next to it says how much of it is base-rate
+        # separation between tasks rather than within-task signal.
         log = {
             "val/auroc_zero_shot": auroc,
             "val/mtp_loss": mtp_loss,
             "val/score_db": float("nan"),
         }
+        log.update(
+            decompose_val_auroc(preds_np, labels_bin, task_ids_np, self.task_names)
+        )
         log.update(_mean_stats(stats_accum, stats_count, prefix="val/"))
 
         if (
@@ -164,9 +183,21 @@ class ValAUROCCallback:
             print(f"\n[ckpt] new best auroc={auroc:.4f} @ step={step} -> {ckpt_dir}/best.pt")
 
         wandb.log(log, step=step)
+        per_task = "  ".join(
+            f"{name}={log[f'val/auroc/{name}']:.4f}"
+            f"(p={log[f'val/base_rate/{name}']:.3f})"
+            for name in sorted(
+                k[len("val/auroc/"):] for k in log if k.startswith("val/auroc/")
+            )
+        )
         print(
-            f"\nstep={step}  val/auroc_zero_shot={auroc:.4f}"
+            f"\nstep={step}  pooled={auroc:.4f}"
+            f"  mean_per_task={log['val/auroc_mean_per_task']:.4f}"
+            f"  between={log['val/auroc_between']:.4f}"
+            f"  cross_weight={log['val/pooled_cross_weight']:.3f}"
+            f"  tie_frac={log['val/pred_tie_frac']:.3f}"
             f"  val/mtp_loss={mtp_loss:.4f}"
+            f"\n          {per_task}"
         )
         net.train()
 
