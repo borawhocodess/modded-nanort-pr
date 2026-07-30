@@ -171,6 +171,76 @@ objeto — passam a medir efeito sobre `auroc_mean_per_task`, que pode estar em 
 Como obter a leitura sem gastar 45 min: `eval_at_step1=1` (default do YAML) + `max_steps`
 pequeno já entrega a decomposição no step 1, que é ~init.
 
+#### Resultado — G0 FECHADO
+
+Projeto wandb `nanort-ablation`, `holdout_db=rel-avito`, `sigreg_layer=0`,
+`λ_col=1e-3`, `qk_norm=1`, **`update_relations=1`**, `muon_warmup_steps=200`, seed 0.
+Runs `earthy-sea-1` / `golden-deluge-2` (step 1, réplicas exatas) e `deft-totem-3`
+(51 steps, `val_eval_freq=5`).
+
+**Base rates medidos — o cenário extremo:**
+
+| task | n⁺ | n⁻ | base rate |
+|---|---|---|---|
+| `user-visits/num_click` | 27 086 | 2 893 | **0.9035** |
+| `user-clicks/num_click` | 745 | 20 438 | **0.0352** |
+
+Daí `auroc_between = 0.9246` e `pooled_cross_weight = 0.8559`: **86% da métrica
+reportada repousa em pares entre tarefas** — comparar um positivo de `user-visits`
+contra um negativo de `user-clicks`, que o benchmark nunca pede.
+
+**A curva (`deft-totem-3`):**
+
+| step | pooled | mean/task | visits | clicks | within | cross | tie_frac | mtp_loss |
+|---|---|---|---|---|---|---|---|---|
+| 1  | 0.3257 | 0.5264 | 0.5100 | 0.5427 | 0.5153 | 0.2938 | 0.966 | 0.7045 |
+| 10 | 0.3330 | 0.5334 | 0.5197 | 0.5471 | 0.5242 | 0.3009 | 0.965 | 0.7035 |
+| 25 | 0.4222 | 0.5595 | 0.5502 | 0.5688 | 0.5532 | 0.4002 | 0.953 | 0.7001 |
+| 40 | 0.6980 | 0.5807 | 0.6038 | 0.5575 | 0.5963 | 0.7151 | 0.986 | 0.7127 |
+| 50 | 0.7696 | 0.5733 | 0.6017 | 0.5448 | 0.5925 | 0.7994 | 0.989 | 0.7666 |
+
+Decompondo o ganho de 50 steps pela identidade exata:
+
+```
+Δpooled  = 0.4439
+  cross  = 0.856 · (0.7994 − 0.2938) = 0.4328   ← 97.5% do ganho
+  within = 0.144 · (0.5925 − 0.5153) = 0.0111   ←  2.5% do ganho
+```
+
+**97.5% do que o modelo "aprende" na métrica reportada é ordenar as duas tarefas,
+não prever `num_click`.** E há confirmação mecânica independente: `tie_frac` sobe de
+0.966 para 0.989 e `mtp_loss` *sobe* de 0.700 (step 25) para 0.767 — o modelo está
+colapsando as predições em dois níveis, um por coluna-alvo, que é exatamente a
+solução que maximiza o pooled sem aprender nada relacional.
+
+O sinal intra-tarefa existe mas é pequeno: `mean_per_task` vai de 0.526 a 0.581
+(pico, step 40). Com n⁺=745 em `user-clicks`, o SE por eval é ≈0.018 nessa tarefa e
+≈0.009 em `user-visits`, logo ≈0.010 na média — o 0.581 está ~8σ acima de 0.5, é
+real, e é 0.58, não 0.87.
+
+**Ruído de medida (0.3, de graça pelas réplicas):** deltas de **2–5·10⁻⁴** em todos
+os AUROCs entre `earthy-sea-1` e `golden-deluge-2`. Contagens, `base_rate`,
+`cross_weight`, `pred_tie_frac` e `pred_unique` bit-idênticos → o subgrafo de val
+está pinado, confirmado; o resíduo é o `index_add_` atômico. Piso de ruído de kernel
+muito melhor que o temido: ~5·10⁻⁴. **O SE amostral de `user-clicks` (0.018) é a
+restrição real de poder, não o kernel.**
+
+**`R_avito = 14`** (`r_table_size`), 13 tipos ativos por batch, `edge_count` ≈
+1.16 M, `parent_match_rate` = 0.999, `edges_per_q` = 10.6. Responde 0.5, e enterra
+`D3` definitivamente: `B·R·S²` = 3.8·10⁹ contra `T` = 1.2·10⁶, ~3000× pior.
+
+**`time_to_target = −1`**: não cruzou 0.81621 em 50 steps. Extrapolando a curva de
+`cross`, cruzaria por volta do step 60–70 — ou seja, o "record" é o tempo até o
+modelo aprender os dois base rates.
+
+**Ainda não verificado:** o 0.87 do doc é atribuído a `update_relations=False`
+(§7: *"the dynamic RelAttn corrupted the text prior"*) e as três runs usaram
+`update_relations=1` e `muon_warmup_steps=200` (o doc diz 3000). Nesta config o step 1
+dá pooled = **0.326**, não 0.87 — o init ordena as tarefas ao *contrário*, o que
+mostra de passagem que o sinal é **arbitrário em sinal**: o mesmo mecanismo, com a
+direção invertida, encosta no teto de 0.9246. Falta rodar a variante staticrel para
+decompor o 0.87 nominal.
+
 **0.2 — `AUROC@0` e sua distribuição sobre seeds.** Uma linha para habilitar
 (`val_callback.step(0, net)` antes do loop de treino; `0 % eval_every == 0` já passa o
 guard de [main.py:107](../rt/main.py#L107)), mais um flag para impedir
