@@ -247,13 +247,50 @@ contra os **446 s** do record de 7m26s. Ou seja o record é, com boa aproximaç�
 Confirma a Fase 5: `t2t` precisa ser decomposto em startup / treino / eval antes de
 qualquer comparação.
 
-**Ainda não verificado:** o 0.87 do doc é atribuído a `update_relations=False`
-(§7: *"the dynamic RelAttn corrupted the text prior"*) e as três runs usaram
-`update_relations=1` e `muon_warmup_steps=200` (o doc diz 3000). Nesta config o step 1
-dá pooled = **0.326**, não 0.87 — o init ordena as tarefas ao *contrário*, o que
-mostra de passagem que o sinal é **arbitrário em sinal**: o mesmo mecanismo, com a
-direção invertida, encosta no teto de 0.9246. Falta rodar a variante staticrel para
-decompor o 0.87 nominal.
+#### Resultado — o 0.87 é o init (`vague-eon-4`)
+
+Config vencedora do doc: `update_relations=0`, `muon_warmup_steps=3000`,
+`sigreg_layer=0`, `λ_col=1e-3`, com `eval_at_step0=1`.
+
+| step | pooled | mean/task | visits | clicks | within | cross | tie_frac |
+|---|---|---|---|---|---|---|---|
+| **0** (zero gradientes) | **0.8651** | **0.5682** | 0.5719 | 0.5644 | 0.5707 | 0.9146 | 0.991 |
+| 1 | 0.8676 | 0.5686 | 0.5733 | 0.5639 | 0.5718 | 0.9174 | 0.991 |
+| 25 | 0.8753 | 0.5754 | 0.5825 | 0.5683 | 0.5802 | 0.9249 | 0.991 |
+
+`val/target_crossed_at_init = 1`: **o alvo 0.81621 é cruzado com zero passos de
+gradiente.** O 0.87 do doc está inteiro no init — 0.8651 antes de treinar, 0.8753 no
+step 25. E `train/time_to_target` = **154 s**, disparado no step 1, que é exatamente
+a duração de um eval (155 s medidos). Nesta config o "record" é um eval.
+
+Resposta à pergunta que estava aberta — o `within` do 0.87 é **0.568**, não 0.75.
+O ganho de 25 steps no pooled é +0.0102, e 86% dele ainda é `cross`
+(0.144·0.0095 + 0.856·0.0103 = 0.0102, identidade fechando). `cross` no step 25 é
+0.9249 contra um teto de 0.9246: **saturado no teto de base rate.**
+
+**O que `update_relations` realmente faz.** Comparando os inits (no step 0/1 o
+warmup é irrelevante, então a comparação é limpa):
+
+| | within@init | cross@init | pooled@init |
+|---|---|---|---|
+| `update_relations=1` | ~0.515 | **0.294** | 0.326 |
+| `update_relations=0` | 0.571 | **0.915** | 0.865 |
+
+O `within` difere pouco (0.52 → 0.57). O pooled difere **0.54**, e é quase todo a
+*direção* do `cross`. Ou seja: "a rota estática é a vencedora" é, em grande parte,
+sobre qual direção o init aponta no eixo que não interessa. O mecanismo é o `RelAttn`
+(quase-uniforme, +56% na norma de `r`): com ele, a ordenação entre tarefas sai
+invertida; sem ele, `r_update_frac = 1` (o prior de texto fica intacto) e sai certa.
+
+**O achado positivo.** `mean_per_task = 0.568` no init, sem um único gradiente, é
+~6.8σ acima de 0.5 (SE ≈ 0.010). Random features mais embeddings de texto de schema
+dão AUROC por tarefa de 0.57 em zero-shot cross-DB **sem treino**. E 25 steps de
+treino somam +0.007. Isso é o "paper 2" da lista: um baseline *training-free*.
+
+**Custo do eval — correção.** A otimização de `need_stats` rendeu pouco: 163 s → 155 s
+(~5%). O gargalo não eram os syncs de stats, é o forward sobre os ~200 batches do val
+loader inteiro. Reduzir de verdade exige capar o número de batches, ao custo de
+variância — e com n⁺ = 745 em `user-clicks` o SE já é 0.018, então não há espaço.
 
 **0.2 — `AUROC@0` e sua distribuição sobre seeds.** Uma linha para habilitar
 (`val_callback.step(0, net)` antes do loop de treino; `0 % eval_every == 0` já passa o
