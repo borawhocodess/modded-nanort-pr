@@ -20,7 +20,7 @@ from rt.config import TrainConfig
 from rt.data import RelationalDataset, get_column_index
 from rt.model import RelationalTransformer
 from rt.optim import Muon, build_muon_param_groups
-from rt.val_metrics import decompose_val_auroc
+from rt.val_metrics import decompose_val_auroc, eval_is_due
 
 
 # NanoRT: 45-minute wall-clock training timer ──────────────────────────────────
@@ -68,6 +68,8 @@ class ValAUROCCallback:
         eval_every: int,
         timer: TrainTimer | None = None,
         eval_at_step1: bool = True,
+        dense_until: int = 0,
+        dense_freq: int = 5,
         save_ckpt_dir: str | None = None,
     ):
         val_dataset = RelationalDataset(
@@ -108,13 +110,27 @@ class ValAUROCCallback:
         # step 1, which is not a trained-model crossing. Skipping it makes the
         # metric reflect a real checkpoint.
         self.eval_at_step1 = eval_at_step1
+        # Evaluate every `dense_freq` steps up to `dense_until`, then fall back to
+        # `eval_every`. The zero-shot auroc peaks within the first few dozen steps,
+        # which the default eval_every=100 steps straight over.
+        self.dense_until = dense_until
+        self.dense_freq = max(1, dense_freq)
         # Save the best-by-zero-shot-auroc checkpoint. The auroc peaks early and
         # decays, so the budget-end checkpoint is NOT the best one to keep.
         self.save_ckpt_dir = save_ckpt_dir
         self.best_auroc = -float("inf")
 
+    def _due(self, step: int) -> bool:
+        return eval_is_due(
+            step,
+            eval_every=self.eval_every,
+            eval_at_step1=self.eval_at_step1,
+            dense_until=self.dense_until,
+            dense_freq=self.dense_freq,
+        )
+
     def step(self, step: int, net: torch.nn.Module) -> None:
-        if step % self.eval_every != 0 and not (step == 1 and self.eval_at_step1):
+        if not self._due(step):
             return
 
         net.eval()
@@ -163,8 +179,23 @@ class ValAUROCCallback:
         )
         log.update(_mean_stats(stats_accum, stats_count, prefix="val/"))
 
+        # Step 0 is the zero-gradient baseline: it must never set time_to_target
+        # (the timer has not even started, so it would read ~0s and the metric
+        # would be meaningless). Record the crossing as a flag instead — an init
+        # that already clears the target is the finding, not a 0-second record.
+        if step == 0:
+            crossed = float(auroc >= self.TARGET_AUROC)
+            log["val/target_crossed_at_init"] = crossed
+            if crossed:
+                print(
+                    f"\n*** TARGET ALREADY CLEARED AT INIT (step 0, zero gradient "
+                    f"steps): auroc={auroc:.4f} >= {self.TARGET_AUROC} — "
+                    f"time_to_target is degenerate for this config ***"
+                )
+
         if (
-            self._time_to_target is None
+            step > 0
+            and self._time_to_target is None
             and auroc >= self.TARGET_AUROC
             and self.timer is not None
         ):
@@ -320,6 +351,9 @@ def main(cfg: TrainConfig):
     val_eval_freq = cfg.val_eval_freq
     time_budget_minutes = cfg.time_budget_minutes
     eval_at_step1 = cfg.eval_at_step1
+    eval_at_step0 = cfg.eval_at_step0
+    val_eval_dense_until = cfg.val_eval_dense_until
+    val_eval_dense_freq = cfg.val_eval_dense_freq
 
     seed_everything(seed)
 
@@ -361,6 +395,8 @@ def main(cfg: TrainConfig):
             eval_every=_freq,
             timer=timer,
             eval_at_step1=eval_at_step1,
+            dense_until=val_eval_dense_until,
+            dense_freq=val_eval_dense_freq,
             save_ckpt_dir=save_ckpt_dir,
         )
 
@@ -806,6 +842,14 @@ def main(cfg: TrainConfig):
                         )
                     warm_loss.backward()
                 opt_zero_grad()
+
+            # Zero-gradient baseline. Placed *after* the compile warm-up on
+            # purpose: the warm-up backward has to be the first backward the
+            # compiler sees (see above), and an eval-mode inference_mode forward
+            # ahead of it would risk re-introducing the bug c0b1d52 fixed. No
+            # optimizer step has run yet, so this measures the init exactly.
+            if steps == 0 and val_callback is not None and eval_at_step0:
+                val_callback.step(0, net)
 
             loss, _, train_stats = net(batch, need_stats=need_stats)
             # SIGReg: L = (1-λc-λr)·L_sup + λc·R_col + λr·R_row (paper §2.4).

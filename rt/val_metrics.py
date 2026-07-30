@@ -19,6 +19,33 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 
 
+def eval_is_due(
+    step: int,
+    *,
+    eval_every: int,
+    eval_at_step1: bool,
+    dense_until: int = 0,
+    dense_freq: int = 5,
+) -> bool:
+    """Whether `step` gets a val eval.
+
+    Step 0 is the zero-gradient baseline and is only ever reached by an explicit
+    call, so it always answers True. Below `dense_until` the period is
+    `dense_freq`, above it `eval_every` — the zero-shot AUROC peaks within the
+    first few dozen steps, which the default eval_every=100 steps straight over.
+
+    With ``dense_until=0`` this reproduces the original schedule exactly: every
+    `eval_every` steps, plus step 1 when `eval_at_step1`. Note that step 1 is due
+    whenever the *period* lands on it, regardless of `eval_at_step1` — that flag
+    only ever adds step 1, it never removes it (the original condition was a
+    conjunction, and a unit test pins the equivalence).
+    """
+    if step == 0:
+        return True
+    period = max(1, dense_freq) if step <= dense_until else eval_every
+    return step % period == 0 or (step == 1 and eval_at_step1)
+
+
 def safe_auroc(labels_bin, preds) -> float:
     """AUROC, or nan when the group holds a single class."""
     if len(set(labels_bin)) < 2:

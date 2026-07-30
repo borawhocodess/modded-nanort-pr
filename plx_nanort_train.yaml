@@ -170,6 +170,27 @@ inputs:
     type: str
     isOptional: true
     value: "1"
+  - name: eval_at_step0
+    description: >
+      "1" (default) evaluates val auroc at step 0 — before any optimizer step —
+      giving the zero-gradient baseline. Never sets time_to_target; an init that
+      already clears the target is logged as val/target_crossed_at_init.
+    type: str
+    isOptional: true
+    value: "1"
+  - name: val_eval_dense_until
+    description: >
+      Evaluate every `val_eval_dense_freq` steps up to this step, then fall back
+      to val_eval_freq. The zero-shot auroc peaks within the first few dozen
+      steps, which val_eval_freq=100 misses. 0 = disabled.
+    type: int
+    isOptional: true
+    value: 0
+  - name: val_eval_dense_freq
+    description: Eval period while below val_eval_dense_until.
+    type: int
+    isOptional: true
+    value: 5
   - name: hf_token
     description: HuggingFace token for higher rate limits on artifact download.
     type: str
@@ -350,6 +371,12 @@ run:
         value: "{{ muon_warmup_steps }}"
       - name: NANORT_EVAL_AT_STEP1
         value: "{{ eval_at_step1 }}"
+      - name: NANORT_EVAL_AT_STEP0
+        value: "{{ eval_at_step0 }}"
+      - name: NANORT_VAL_EVAL_DENSE_UNTIL
+        value: "{{ val_eval_dense_until }}"
+      - name: NANORT_VAL_EVAL_DENSE_FREQ
+        value: "{{ val_eval_dense_freq }}"
       - name: NANORT_HOLDOUT_DB
         value: "{{ holdout_db }}"
       - name: NANORT_OPTIMIZER

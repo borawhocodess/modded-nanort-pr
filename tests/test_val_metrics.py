@@ -54,6 +54,7 @@ except ModuleNotFoundError:  # stub it so the algebra is still testable
 from rt.val_metrics import (  # noqa: E402
     auroc_between_ceiling,
     decompose_val_auroc,
+    eval_is_due,
     pooled_auroc_parts,
 )
 
@@ -190,6 +191,39 @@ def test_unmapped_task_id_and_single_class_task():
     assert abs(
         out1["val/auroc_mean_per_task"] - _midrank_auroc(y_b[:100], s_b[:100])
     ) < 1e-9
+
+
+def test_eval_schedule_is_backwards_compatible():
+    """dense_until=0 must reproduce the pre-existing schedule exactly, so the
+    record runs stay comparable."""
+    def old(step, eval_every, at1):  # the original one-liner from main.py
+        return not (step % eval_every != 0 and not (step == 1 and at1))
+
+    for at1 in (True, False):
+        for every in (1, 5, 100):
+            for step in range(1, 400):
+                got = eval_is_due(
+                    step, eval_every=every, eval_at_step1=at1, dense_until=0
+                )
+                assert got == old(step, every, at1), (step, every, at1, got)
+
+
+def test_eval_schedule_dense_window():
+    kw = dict(eval_every=100, eval_at_step1=True, dense_until=50, dense_freq=5)
+    due = [s for s in range(0, 251) if eval_is_due(s, **kw)]
+    # step 0 baseline, step 1, every 5 up to 50, then back to every 100
+    assert due == [0, 1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 100, 200]
+    # the step-25 peak the default schedule misses is inside the dense window
+    assert 25 in due
+    assert 25 not in [
+        s for s in range(1, 251)
+        if eval_is_due(s, eval_every=100, eval_at_step1=True, dense_until=0)
+    ]
+
+
+def test_step0_always_due_even_when_step1_disabled():
+    assert eval_is_due(0, eval_every=100, eval_at_step1=False)
+    assert not eval_is_due(1, eval_every=100, eval_at_step1=False)
 
 
 if __name__ == "__main__":

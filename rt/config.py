@@ -132,6 +132,16 @@ class TrainConfig:
     max_eval_steps: int = 40
     val_eval_freq: int | None = 100
     eval_at_step1: bool = True
+    # Zero-gradient baseline: evaluate the model exactly as initialised, before
+    # any optimizer step. Separates "the init already scores this" from "training
+    # got here" — the two are indistinguishable when the first eval is at step 1.
+    eval_at_step0: bool = True
+    # Dense early evals: up to `val_eval_dense_until`, evaluate every
+    # `val_eval_dense_freq` steps instead of every `val_eval_freq`. The zero-shot
+    # AUROC peaks within the first few dozen steps, which a freq of 100 misses
+    # entirely. 0 disables (plain val_eval_freq everywhere).
+    val_eval_dense_until: int = 0
+    val_eval_dense_freq: int = 5
     time_budget_minutes: float | None = 45.0
     load_ckpt_path: str | None = None
     save_ckpt_dir: str | None = None
@@ -167,6 +177,13 @@ class TrainConfig:
             sigreg_col_global_pool=_bool("NANORT_SIGREG_COL_POOL", cls.sigreg_col_global_pool),
             val_eval_freq=_int("NANORT_VAL_EVAL_FREQ", cls.val_eval_freq),
             eval_at_step1=_bool("NANORT_EVAL_AT_STEP1", cls.eval_at_step1),
+            eval_at_step0=_bool("NANORT_EVAL_AT_STEP0", cls.eval_at_step0),
+            val_eval_dense_until=_int(
+                "NANORT_VAL_EVAL_DENSE_UNTIL", cls.val_eval_dense_until
+            ),
+            val_eval_dense_freq=_int(
+                "NANORT_VAL_EVAL_DENSE_FREQ", cls.val_eval_dense_freq
+            ),
             time_budget_minutes=_float("NANORT_TIME_BUDGET_MINUTES", cls.time_budget_minutes),
             save_ckpt_dir=os.environ.get("NANORT_SAVE_CKPT_DIR") or None,
         )
