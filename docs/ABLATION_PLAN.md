@@ -233,6 +233,20 @@ restrição real de poder, não o kernel.**
 `cross`, cruzaria por volta do step 60–70 — ou seja, o "record" é o tempo até o
 modelo aprender os dois base rates.
 
+**Custo: o eval domina o wall-clock.** Dos incrementos de `train/elapsed_seconds`
+em `deft-totem-3`: um step de treino custa **1.6 s**, um eval custa **163 s** — um
+eval vale ~100 steps. O `ValAUROCCallback` roda o val loader inteiro (~200 batches,
+51 k seeds) sem o cap `max_eval_steps` que o `evaluate()` herdado usa, e chamava
+`net(batch)` com o default `need_stats=True`, computando ~40 diagnósticos por batch
+com `.unique()` e um sync GPU→CPU por stat.
+
+Isso reenquadra o record: com `val_eval_freq=100` e `eval_at_step1=1`, chegar ao
+eval do step 100 custa ≈ 163 (eval@1) + 160 (99 steps) + 163 (eval@100) ≈ **486 s**,
+contra os **446 s** do record de 7m26s. Ou seja o record é, com boa aproximação,
+**"o AUROC no step 100" — e mais da metade do wall-clock foi avaliação, não treino.**
+Confirma a Fase 5: `t2t` precisa ser decomposto em startup / treino / eval antes de
+qualquer comparação.
+
 **Ainda não verificado:** o 0.87 do doc é atribuído a `update_relations=False`
 (§7: *"the dynamic RelAttn corrupted the text prior"*) e as três runs usaram
 `update_relations=1` e `muon_warmup_steps=200` (o doc diz 3000). Nesta config o step 1

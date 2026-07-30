@@ -146,9 +146,18 @@ class ValAUROCCallback:
                 batch["is_targets"][true_batch_size:, :] = False
                 batch["is_padding"][true_batch_size:, :] = True
 
-                loss, yhat_dict, _stats = net(batch)
-                _accumulate_stats(stats_accum, _stats)
-                stats_count += 1
+                # need_stats defaults to True, which makes the model compute ~40
+                # diagnostics per batch — including .unique() calls — and
+                # _accumulate_stats then forces a GPU->CPU sync for every one of
+                # them. Over the full val loader that is thousands of syncs per
+                # eval, and an eval costs ~100 training steps. The stats are
+                # averaged over batches anyway, so take them from the first batch
+                # only: same diagnostic, a fraction of the syncs.
+                want_stats = stats_count == 0
+                loss, yhat_dict, _stats = net(batch, need_stats=want_stats)
+                if want_stats:
+                    _accumulate_stats(stats_accum, _stats)
+                    stats_count += 1
                 yhat = yhat_dict["boolean"][batch["is_targets"]]
                 y = batch["boolean_values"][batch["is_targets"]].flatten()
 
