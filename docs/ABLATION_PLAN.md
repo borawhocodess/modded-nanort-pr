@@ -252,11 +252,33 @@ qualquer comparação.
 Config vencedora do doc: `update_relations=0`, `muon_warmup_steps=3000`,
 `sigreg_layer=0`, `λ_col=1e-3`, com `eval_at_step0=1`.
 
-| step | pooled | mean/task | visits | clicks | within | cross | tie_frac |
-|---|---|---|---|---|---|---|---|
-| **0** (zero gradientes) | **0.8651** | **0.5682** | 0.5719 | 0.5644 | 0.5707 | 0.9146 | 0.991 |
-| 1 | 0.8676 | 0.5686 | 0.5733 | 0.5639 | 0.5718 | 0.9174 | 0.991 |
-| 25 | 0.8753 | 0.5754 | 0.5825 | 0.5683 | 0.5802 | 0.9249 | 0.991 |
+| step | min | pooled | mean/task | within | cross | mtp_loss |
+|---|---|---|---|---|---|---|
+| **0** (zero gradientes) | 0.0 | **0.8651** | **0.5682** | 0.5707 | 0.9146 | 0.6898 |
+| 1 | 0.0 | 0.8676 | 0.5686 | 0.5718 | 0.9174 | 0.6882 |
+| 25 | 3.1 | **0.8753** ← pico | 0.5754 | 0.5802 | **0.9249** ← teto | 0.6880 |
+| 50 | 6.2 | 0.8724 | 0.5781 | 0.5832 | 0.9211 | 0.6993 |
+| 75 | 9.3 | 0.8726 | 0.5788 | 0.5843 | 0.9212 | 0.7058 |
+| 100 | 12.3 | 0.8721 | 0.5789 | 0.5847 | 0.9204 | 0.7096 |
+| 125 | 15.4 | 0.8699 | 0.5790 | 0.5849 | 0.9179 | 0.7108 |
+| 150 | 18.5 | 0.8636 | 0.5790 | 0.5855 | 0.9104 | 0.7172 |
+| 175 | 21.6 | 0.8585 | 0.5807 | 0.5878 | 0.9041 | 0.7172 |
+
+**O platô é 0.58, e chega em 9 minutos.** `mean_per_task` vai de 0.5682 a ~0.579 no
+step 75 e depois anda dentro do ruído (+0.0001 por janela de 25 steps até o 150).
+O treino inteiro contribui **+0.012** sobre o init. Rodar os 45 min não muda nada:
+o platô é atingido em 1/5 do budget — e desses 9 min, ~1.5 min são treino, o resto eval.
+
+**O "decay do prior de texto" do §8 é o `cross` decaindo.** O pooled pica no step 25
+e cai (0.8753 → 0.8585) enquanto o `within` *sobe* monotonicamente (0.5707 → 0.5878).
+Não é o modelo esquecendo semântica: é o modelo saindo da saturação na ordenação
+entre tarefas conforme passa a usar algum sinal real dentro de cada uma. Explicação
+mecânica limpa do fenômeno que a receita do §7 tentava evitar com warmup longo — o
+warmup preserva um artefato de init, não um prior útil.
+
+**E a `mtp_loss` no holdout piora monotonicamente** (0.6880 → 0.7172 do step 25 ao
+175). O objetivo de reconstrução mascarada não está transferindo para o `rel-avito`:
+treinar melhora `within` em milésimos e piora a reconstrução zero-shot.
 
 `val/target_crossed_at_init = 1`: **o alvo 0.81621 é cruzado com zero passos de
 gradiente.** O 0.87 do doc está inteiro no init — 0.8651 antes de treinar, 0.8753 no
