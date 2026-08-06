@@ -6,5 +6,7 @@ __pycache__
 .vscode
 /ckpts
 .DS_Store
-.polyaxon/
-backup/
+.claude
+.polyaxon
+.gitfilter
+/backup

@@ -4,6 +4,7 @@ Canonical implementation from https://github.com/KellerJordan/Muon
 Newton-Schulz orthogonalisation with quintic coefficients, bfloat16 internals,
 Nesterov momentum applied before orthogonalisation.
 """
+
 import torch
 
 
@@ -13,7 +14,11 @@ def _zeropower_via_newtonschulz5(G: torch.Tensor, steps: int) -> torch.Tensor:
     Quintic coefficients from Jordan (2024) — converges in 5 steps for typical
     gradient matrices encountered in transformer training.
     """
-    assert G.ndim >= 2
+    if G.ndim < 2:
+        raise ValueError(
+            "Newton-Schulz orthogonalisation requires a tensor with at least "
+            "two dimensions."
+        )
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     if G.size(0) > G.size(1):
@@ -53,7 +58,13 @@ class Muon(torch.optim.Optimizer):
         ns_steps: int = 5,
         weight_decay: float = 0.0,
     ):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay)
+        defaults = {
+            "lr": lr,
+            "momentum": momentum,
+            "nesterov": nesterov,
+            "ns_steps": ns_steps,
+            "weight_decay": weight_decay,
+        }
         super().__init__(params, defaults)
 
     @torch.no_grad()

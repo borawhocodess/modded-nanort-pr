@@ -1,100 +1,100 @@
 #!/usr/bin/env bash
-# Reproduces the current record on 1x H200: Muon + SIGReg col-view.
-# Usage: ./run.sh [--holdout-db rel-avito] [--hf-repo <user/repo>] [--optimizer muon] [--muon-lr 5e-3]
-#                 [--hf-ckpt-repo <user/repo>] [--hf-ckpt-name sigreg] [--stop-at-target]
+# Reproduce record #4 (309 s / 5m09s) on one NVIDIA H200.
+#
+# Configuration is environment-only; scripts/nanort_train.py intentionally has
+# no CLI parser. Override any NANORT_* value before invoking this script.
 set -euo pipefail
 
-HOLDOUT_DB="${HOLDOUT_DB:-rel-avito}"
-HF_REPO="${HF_REPO:-gabrielveloso/nanort-artifacts}"
-OPTIMIZER="${OPTIMIZER:-muon}"
-MUON_LR="${MUON_LR:-5e-3}"
+if [[ $# -ne 0 ]]; then
+  echo "run.sh accepts configuration through environment variables only." >&2
+  echo "Example: NANORT_SEED=1 HF_REPO=user/nanort-artifacts ./run.sh" >&2
+  exit 2
+fi
 
-# SIGReg col-view record config (see README.md):
-SIGREG_LAYER="${SIGREG_LAYER:-0}"
-SIGREG_LAMBDA_ROW="${SIGREG_LAMBDA_ROW:-0.0}"
-SIGREG_LAMBDA_COL="${SIGREG_LAMBDA_COL:-0.001}"
-SIGREG_COL_POOL="${SIGREG_COL_POOL:-1}"
-
-# Record-reproducing run shape (overridable via env):
+export NANORT_HOLDOUT_DB="${NANORT_HOLDOUT_DB:-rel-avito}"
 export NANORT_BATCH_SIZE="${NANORT_BATCH_SIZE:-256}"
-export NANORT_VAL_EVAL_FREQ="${NANORT_VAL_EVAL_FREQ:-500}"
+export NANORT_OPTIMIZER="${NANORT_OPTIMIZER:-muon}"
+export NANORT_LR="${NANORT_LR:-0.001}"
+export NANORT_MUON_LR="${NANORT_MUON_LR:-0.005}"
+export NANORT_MUON_WARMUP_STEPS="${NANORT_MUON_WARMUP_STEPS:-3000}"
+export NANORT_MAX_STEPS="${NANORT_MAX_STEPS:-1000000}"
+export NANORT_LR_TOTAL_STEPS="${NANORT_LR_TOTAL_STEPS:-0}"
 
-# Optional HuggingFace checkpoint upload at the AUROC target (off by default):
-HF_CKPT_REPO="${HF_CKPT_REPO:-}"
-HF_CKPT_NAME="${HF_CKPT_NAME:-sigreg}"
-STOP_AT_TARGET="${STOP_AT_TARGET:-0}"
+export NANORT_SIMPLICIAL_LAYERS="${NANORT_SIMPLICIAL_LAYERS:-all}"
+export NANORT_UPDATE_RELATIONS="${NANORT_UPDATE_RELATIONS:-0}"
+export NANORT_QK_NORM="${NANORT_QK_NORM:-1}"
+export NANORT_SIMPLICIAL_LAYERSCALE_INIT="${NANORT_SIMPLICIAL_LAYERSCALE_INIT:-1.0}"
 
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    --holdout-db)   HOLDOUT_DB="$2";        shift 2 ;;
-    --hf-repo)      HF_REPO="$2";           shift 2 ;;
-    --optimizer)    OPTIMIZER="$2";         shift 2 ;;
-    --muon-lr)      MUON_LR="$2";           shift 2 ;;
-    --hf-ckpt-repo) HF_CKPT_REPO="$2";      shift 2 ;;
-    --hf-ckpt-name) HF_CKPT_NAME="$2";      shift 2 ;;
-    --stop-at-target) STOP_AT_TARGET=1;     shift   ;;
-    *) echo "Unknown arg: $1"; exit 1 ;;
-  esac
+export NANORT_SIGREG_LAYER="${NANORT_SIGREG_LAYER:-0}"
+export NANORT_SIGREG_LAMBDA_ROW="${NANORT_SIGREG_LAMBDA_ROW:-0.0}"
+export NANORT_SIGREG_LAMBDA_COL="${NANORT_SIGREG_LAMBDA_COL:-0.001}"
+export NANORT_SIGREG_N_PROJ="${NANORT_SIGREG_N_PROJ:-64}"
+export NANORT_SIGREG_MIN_GROUP="${NANORT_SIGREG_MIN_GROUP:-8}"
+export NANORT_SIGREG_COL_POOL="${NANORT_SIGREG_COL_POOL:-1}"
+
+# The official timer includes scheduled validation. Step 0 is an untimed
+# diagnostic; step 1 is skipped and the first eligible record eval is step 100.
+export NANORT_EVAL_AT_STEP0="${NANORT_EVAL_AT_STEP0:-1}"
+export NANORT_EVAL_AT_STEP1="${NANORT_EVAL_AT_STEP1:-0}"
+export NANORT_VAL_EVAL_FREQ="${NANORT_VAL_EVAL_FREQ:-100}"
+export NANORT_VAL_EVAL_DENSE_UNTIL="${NANORT_VAL_EVAL_DENSE_UNTIL:-0}"
+export NANORT_TIME_BUDGET_MINUTES="${NANORT_TIME_BUDGET_MINUTES:-45}"
+
+HF_REPO="${HF_REPO:-gabrielveloso/nanort-artifacts}"
+HF_REVISION_REQUESTED="${HF_REVISION:-main}"
+NANORT_ARTIFACT_ROOT="${NANORT_ARTIFACT_ROOT:-${HOME}/scratch/nanort_artifacts}"
+NANORT_PRE_ROOT="${NANORT_PRE_ROOT:-${HOME}/scratch/pre}"
+ARTIFACT_PREFIX="ra-holdout-${NANORT_HOLDOUT_DB}"
+
+echo "nanoRT record #4 configuration"
+echo "  holdout=${NANORT_HOLDOUT_DB} optimizer=${NANORT_OPTIMIZER} seed=${NANORT_SEED:-0}"
+echo "  simplicial=${NANORT_SIMPLICIAL_LAYERS} update_relations=${NANORT_UPDATE_RELATIONS} qk_norm=${NANORT_QK_NORM}"
+echo "  sigreg_layer=${NANORT_SIGREG_LAYER} lambda_row=${NANORT_SIGREG_LAMBDA_ROW} lambda_col=${NANORT_SIGREG_LAMBDA_COL}"
+echo "  val_freq=${NANORT_VAL_EVAL_FREQ} step0=${NANORT_EVAL_AT_STEP0} step1=${NANORT_EVAL_AT_STEP1}"
+
+pixi install --locked
+
+# Resolve a mutable branch/tag once, then download and log the immutable Hub
+# commit. Set HF_REVISION to the recorded commit to reproduce a paper run later.
+HF_REVISION_RESOLVED="$(
+  pixi run python - "${HF_REPO}" "${HF_REVISION_REQUESTED}" <<'PY'
+import sys
+
+from huggingface_hub import HfApi
+
+repo_id, revision = sys.argv[1:]
+print(HfApi().repo_info(repo_id=repo_id, repo_type="dataset", revision=revision).sha)
+PY
+)"
+export NANORT_ARTIFACT_REPO="${HF_REPO}"
+export NANORT_ARTIFACT_REVISION="${HF_REVISION_RESOLVED}"
+echo "  artifact=${NANORT_ARTIFACT_REPO}@${NANORT_ARTIFACT_REVISION}"
+
+(
+  cd rustler
+  pixi run maturin develop --uv --release
+)
+
+mkdir -p "${NANORT_ARTIFACT_ROOT}" "${NANORT_PRE_ROOT}"
+pixi run hf download "${HF_REPO}" \
+  --repo-type dataset \
+  --revision "${HF_REVISION_RESOLVED}" \
+  --include "${ARTIFACT_PREFIX}/train/*" \
+  --include "${ARTIFACT_PREFIX}/val/*" \
+  --local-dir "${NANORT_ARTIFACT_ROOT}"
+
+TRAIN_ROOT="${NANORT_ARTIFACT_ROOT}/${ARTIFACT_PREFIX}/train"
+VAL_ROOT="${NANORT_ARTIFACT_ROOT}/${ARTIFACT_PREFIX}/val/${NANORT_HOLDOUT_DB}"
+if [[ ! -d "${TRAIN_ROOT}" || ! -d "${VAL_ROOT}" ]]; then
+  echo "Downloaded artifact layout is incomplete under ${ARTIFACT_PREFIX}." >&2
+  exit 1
+fi
+
+for source_dir in "${TRAIN_ROOT}"/*; do
+  [[ -d "${source_dir}" ]] || continue
+  db_name="$(basename "${source_dir}")"
+  ln -sfn "${source_dir}" "${NANORT_PRE_ROOT}/${db_name}"
 done
+ln -sfn "${VAL_ROOT}" "${NANORT_PRE_ROOT}/${NANORT_HOLDOUT_DB}"
 
-echo "=== nanoRT run ==="
-echo "  holdout    : $HOLDOUT_DB"
-echo "  hf-repo    : $HF_REPO"
-echo "  optimizer  : $OPTIMIZER"
-if [[ "$OPTIMIZER" == "muon" ]]; then
-  echo "  muon-lr    : $MUON_LR"
-fi
-echo "  sigreg     : layer=$SIGREG_LAYER row=$SIGREG_LAMBDA_ROW col=$SIGREG_LAMBDA_COL pool=$SIGREG_COL_POOL"
-echo "  batch_size : $NANORT_BATCH_SIZE"
-if [[ -n "$HF_CKPT_REPO" ]]; then
-  echo "  hf-ckpt    : $HF_CKPT_REPO -> checkpoints/$HF_CKPT_NAME.pt (stop_at_target=$STOP_AT_TARGET)"
-fi
-echo ""
-
-# ── 1. Build Rust extension ───────────────────────────────────────────────────
-cd rustler
-pixi run maturin develop --uv --release
-cd ..
-
-# ── 2. Download artifacts ─────────────────────────────────────────────────────
-mkdir -p ~/scratch/pre
-
-echo "--- Downloading train artifact ---"
-hf download "$HF_REPO" \
-  --repo-type dataset \
-  --include "holdout-${HOLDOUT_DB}/train/*" \
-  --local-dir ~/scratch/nanort_artifacts
-
-echo "--- Downloading val artifact ---"
-hf download "$HF_REPO" \
-  --repo-type dataset \
-  --include "holdout-${HOLDOUT_DB}/val/*" \
-  --local-dir ~/scratch/nanort_artifacts
-
-# ── 3. Symlink into layout rt/data.py expects ─────────────────────────────────
-TRAIN_LINK=~/scratch/pre/nanort-train-${HOLDOUT_DB}
-VAL_LINK=~/scratch/pre/nanort-val-${HOLDOUT_DB}
-
-[ -L "$TRAIN_LINK" ] && rm "$TRAIN_LINK"
-[ -L "$VAL_LINK"   ] && rm "$VAL_LINK"
-
-ln -sf ~/scratch/nanort_artifacts/holdout-${HOLDOUT_DB}/train              "$TRAIN_LINK"
-ln -sf ~/scratch/nanort_artifacts/holdout-${HOLDOUT_DB}/val/${HOLDOUT_DB}  "$VAL_LINK"
-
-# ── 4. Train ──────────────────────────────────────────────────────────────────
-echo "--- Starting training (45 min budget) ---"
-HF_CKPT_ARGS=()
-if [[ -n "$HF_CKPT_REPO" ]]; then
-  HF_CKPT_ARGS+=(--hf-ckpt-repo "$HF_CKPT_REPO" --hf-ckpt-name "$HF_CKPT_NAME")
-  [[ "$STOP_AT_TARGET" == "1" ]] && HF_CKPT_ARGS+=(--stop-at-target)
-fi
-
-pixi run python scripts/nanort_train.py \
-  --holdout-db "$HOLDOUT_DB" \
-  --optimizer  "$OPTIMIZER" \
-  --muon-lr    "$MUON_LR" \
-  --sigreg-layer "$SIGREG_LAYER" \
-  --sigreg-lambda-row "$SIGREG_LAMBDA_ROW" \
-  --sigreg-lambda-col "$SIGREG_LAMBDA_COL" \
-  --sigreg-col-pool "$SIGREG_COL_POOL" \
-  "${HF_CKPT_ARGS[@]}"
+pixi run python -u scripts/nanort_train.py

@@ -16,6 +16,7 @@ use rand::seq::SliceRandom;
 use rand::seq::index;
 use rkyv::rancor::Error;
 use rkyv::vec::ArchivedVec;
+use std::collections::HashMap;
 use std::env::var;
 use std::fs;
 use std::io::{BufReader, Read};
@@ -27,6 +28,7 @@ const MAX_F2P_NBRS: usize = 5;
 struct Vecs {
     node_idxs: Vec<i32>,
     f2p_nbr_idxs: Vec<i32>,
+    f2p_rel_idxs: Vec<i32>,
     table_name_idxs: Vec<i32>,
     col_name_idxs: Vec<i32>,
     class_value_idxs: Vec<i32>,
@@ -46,6 +48,7 @@ struct Vecs {
 struct Slices<'a> {
     node_idxs: &'a mut [i32],
     f2p_nbr_idxs: &'a mut [i32],
+    f2p_rel_idxs: &'a mut [i32],
     table_name_idxs: &'a mut [i32],
     col_name_idxs: &'a mut [i32],
     class_value_idxs: &'a mut [i32],
@@ -67,6 +70,7 @@ impl Vecs {
         Self {
             node_idxs: vec![-1; l],
             f2p_nbr_idxs: vec![-1; l * MAX_F2P_NBRS],
+            f2p_rel_idxs: vec![-1; l * MAX_F2P_NBRS],
             table_name_idxs: vec![0; l],
             col_name_idxs: vec![0; l],
             class_value_idxs: vec![-1; l],
@@ -88,6 +92,7 @@ impl Vecs {
         izip!(
             self.node_idxs.chunks_exact_mut(seq_len),
             self.f2p_nbr_idxs.chunks_exact_mut(seq_len * MAX_F2P_NBRS),
+            self.f2p_rel_idxs.chunks_exact_mut(seq_len * MAX_F2P_NBRS),
             self.table_name_idxs.chunks_exact_mut(seq_len),
             self.col_name_idxs.chunks_exact_mut(seq_len),
             self.class_value_idxs.chunks_exact_mut(seq_len),
@@ -106,6 +111,7 @@ impl Vecs {
             |(
                 node_idxs,
                 f2p_nbr_idxs,
+                f2p_rel_idxs,
                 table_name_idxs,
                 col_name_idxs,
                 class_value_idxs,
@@ -122,6 +128,7 @@ impl Vecs {
             )| Slices {
                 node_idxs,
                 f2p_nbr_idxs,
+                f2p_rel_idxs,
                 table_name_idxs,
                 col_name_idxs,
                 class_value_idxs,
@@ -144,6 +151,9 @@ impl Vecs {
                 .into_py_any(py)
                 .unwrap(),
             ("f2p_nbr_idxs", PyArray1::from_vec(py, self.f2p_nbr_idxs))
+                .into_py_any(py)
+                .unwrap(),
+            ("f2p_rel_idxs", PyArray1::from_vec(py, self.f2p_rel_idxs))
                 .into_py_any(py)
                 .unwrap(),
             (
@@ -211,6 +221,7 @@ struct Dataset {
     mmap: Mmap,
     text_mmap: Mmap,
     p2f_adj_mmap: Mmap,
+    relation_text_idx_to_idx: HashMap<i32, i32>,
     offsets: Vec<i64>,
 }
 
@@ -251,10 +262,13 @@ impl Sampler {
         seed: u64,
         target_columns: Vec<i32>,
         columns_to_drop: Vec<Vec<i32>>,
+        relation_table_offsets: Vec<i32>,
     ) -> Self {
         let mut datasets = Vec::new();
         let mut items = Vec::new();
+        assert_eq!(relation_table_offsets.len(), dataset_tuples.len());
         for (i, (db_name, node_idx_offset, num_nodes)) in dataset_tuples.into_iter().enumerate() {
+            let relation_table_offset = relation_table_offsets[i];
             let pre_path = format!("{}/scratch/pre/{}", var("HOME").unwrap(), db_name);
             let nodes_path = format!("{}/nodes.rkyv", pre_path);
             let file = fs::File::open(&nodes_path).unwrap();
@@ -275,12 +289,23 @@ impl Sampler {
             let p2f_adj_path = format!("{}/p2f_adj.rkyv", pre_path);
             let p2f_adj_file = fs::File::open(&p2f_adj_path).unwrap();
             let p2f_adj_mmap = unsafe { Mmap::map(&p2f_adj_file).unwrap() };
+
+            let relation_text_idxs_path = format!("{}/relation_text_idxs.json", pre_path);
+            let relation_text_idxs_file = fs::File::open(&relation_text_idxs_path).unwrap();
+            let relation_text_idxs: Vec<i32> =
+                serde_json::from_reader(relation_text_idxs_file).unwrap();
+            let relation_text_idx_to_idx = relation_text_idxs
+                .into_iter()
+                .enumerate()
+                .map(|(j, text_idx)| (text_idx, relation_table_offset + j as i32))
+                .collect();
             let target = target_columns[i];
 
             datasets.push(Dataset {
                 mmap,
                 text_mmap,
                 p2f_adj_mmap,
+                relation_text_idx_to_idx,
                 offsets,
             });
 
@@ -462,8 +487,19 @@ impl Sampler {
                 slices.node_idxs[seq_i] = node.node_idx.into();
 
                 assert!(node.f2p_nbr_idxs.len() <= MAX_F2P_NBRS);
-                for (j, f2p_nbr_idx) in node.f2p_nbr_idxs.iter().enumerate() {
+                assert_eq!(node.f2p_nbr_idxs.len(), node.f2p_edges.len());
+                for (j, (f2p_nbr_idx, f2p_edge)) in node
+                    .f2p_nbr_idxs
+                    .iter()
+                    .zip(node.f2p_edges.iter())
+                    .enumerate()
+                {
                     slices.f2p_nbr_idxs[seq_i * MAX_F2P_NBRS + j] = f2p_nbr_idx.into();
+                    let relation_text_idx: i32 = f2p_edge.relation_text_idx.into();
+                    slices.f2p_rel_idxs[seq_i * MAX_F2P_NBRS + j] = *dataset
+                        .relation_text_idx_to_idx
+                        .get(&relation_text_idx)
+                        .unwrap();
                 }
 
                 slices.table_name_idxs[seq_i] = node.table_name_idx.into();
@@ -557,6 +593,7 @@ pub fn main(cli: Cli) {
         0,                          // seed
         vec![-1; 1],                // target_columns
         vec![Vec::<i32>::new()],    // columns_to_drop
+        vec![0],                    // relation_table_offsets
     );
     println!("Sampler loaded in {:?}", tic.elapsed());
 
