@@ -10,8 +10,9 @@ from functools import cache
 import ml_dtypes
 import numpy as np
 import torch
-from rustler import Sampler
 from torch.utils.data import Dataset
+
+from rustler import Sampler
 
 
 @cache
@@ -43,6 +44,47 @@ def get_column_index(column_name: str, table_name: str, db_name: str) -> int:
     return column_index[target]
 
 
+@cache
+def _load_relation_text_idxs(db_name: str) -> tuple[int, ...]:
+    home = os.environ.get("HOME", ".")
+    relation_text_idxs_path = os.path.join(
+        home, "scratch", "pre", db_name, "relation_text_idxs.json"
+    )
+
+    with open(relation_text_idxs_path) as f:
+        return tuple(json.load(f))
+
+
+@cache
+def _load_text_embeddings(
+    db_name: str, embedding_model: str, d_text: int
+) -> np.ndarray:
+    home = os.environ.get("HOME", ".")
+    emb_path = os.path.join(
+        home, "scratch", "pre", db_name, f"text_emb_{embedding_model}.bin"
+    )
+    emb = np.fromfile(emb_path, dtype=ml_dtypes.bfloat16)
+    return emb.reshape(-1, d_text)
+
+
+def _load_relation_embeddings(
+    db_name: str, embedding_model: str, d_text: int
+) -> np.ndarray:
+    relation_text_idxs = _load_relation_text_idxs(db_name)
+    if len(relation_text_idxs) == 0:
+        return np.empty((0, d_text), dtype=ml_dtypes.bfloat16)
+
+    text_embs = _load_text_embeddings(db_name, embedding_model, d_text)
+    max_relation_text_idx = max(relation_text_idxs)
+    if max_relation_text_idx >= text_embs.shape[0]:
+        raise ValueError(
+            f"Relation text index {max_relation_text_idx} is missing from "
+            f"text_emb_{embedding_model}.bin for dataset {db_name}. "
+            "Rerun text embedding after preprocessing."
+        )
+    return text_embs[np.asarray(relation_text_idxs, dtype=np.int64)]
+
+
 class RelationalDataset(Dataset):
     def __init__(
         self,
@@ -59,8 +101,20 @@ class RelationalDataset(Dataset):
         dataset_tuples = []
         target_column_indices = []
         drop_column_indices = []
+        relation_table_offsets = []
+        relation_emb_chunks = []
+        relation_offsets_by_db = {}
 
         for db_name, table_name, target_column, split, columns_to_drop in tasks:
+            if db_name not in relation_offsets_by_db:
+                relation_offsets_by_db[db_name] = sum(
+                    chunk.shape[0] for chunk in relation_emb_chunks
+                )
+                relation_emb_chunks.append(
+                    _load_relation_embeddings(db_name, embedding_model, d_text)
+                )
+            relation_table_offsets.append(relation_offsets_by_db[db_name])
+
             if split == "train":
                 split = "Train"
             elif split == "val":
@@ -105,10 +159,19 @@ class RelationalDataset(Dataset):
             seed=seed,
             target_columns=target_column_indices,
             columns_to_drop=drop_column_indices,
+            relation_table_offsets=relation_table_offsets,
         )
 
         self.seq_len = seq_len
         self.d_text = d_text
+        if relation_emb_chunks:
+            relation_embs = np.concatenate(relation_emb_chunks, axis=0)
+            self.relation_embs = torch.from_numpy(relation_embs.view(np.float16)).view(
+                torch.bfloat16
+            )
+        else:
+            self.relation_embs = torch.empty((0, d_text), dtype=torch.bfloat16)
+        self.r_mask = torch.ones(self.relation_embs.shape[0], dtype=torch.bool)
 
     def __len__(self):
         return self.sampler.len_py()
@@ -141,6 +204,7 @@ class RelationalDataset(Dataset):
         out["class_value_idxs"] = out["class_value_idxs"].view(-1, self.seq_len)
 
         out["f2p_nbr_idxs"] = out["f2p_nbr_idxs"].view(-1, self.seq_len, 5)
+        out["f2p_rel_idxs"] = out["f2p_rel_idxs"].view(-1, self.seq_len, 5)
         out["number_values"] = out["number_values"].view(-1, self.seq_len, 1)
         out["datetime_values"] = out["datetime_values"].view(-1, self.seq_len, 1)
         out["boolean_values"] = (
@@ -150,5 +214,7 @@ class RelationalDataset(Dataset):
         out["col_name_values"] = out["col_name_values"].view(
             -1, self.seq_len, self.d_text
         )
+        out["relation_embs"] = self.relation_embs
+        out["r_mask"] = self.r_mask
 
         return out

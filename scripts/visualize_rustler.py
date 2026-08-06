@@ -1,12 +1,11 @@
 # %%
 import json
-import os
-import random
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import networkx as nx
 from matplotlib.patches import Patch
+
 from rt.data import RelationalDataset
 
 
@@ -42,7 +41,6 @@ def viz(item, ax, dataset_name):
     db_nodes = []
     node_idx_set = set(node_idxs)
 
-    subsequence_len = len(node_idxs)
     for i in range(len(node_idxs)):
         if is_padding[i]:
             continue

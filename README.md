@@ -1,82 +1,231 @@
-# modded-nanoRT
+# nanoRT
 
-This repository hosts the *nanoRT speedrun*, in which we (collaboratively|competitively) search for the fastest way to use 1 NVIDIA H200 to train a Relational Transformer that beats the baseline on [`rel-avito`](https://relbench.stanford.edu/) from RelBench.
+nanoRT is an open, single-GPU speedrun for zero-shot relational foundation model
+pretraining. The goal is to reach a fixed **pooled instance-level AUROC of
+0.81621** on the held-out `rel-avito` domain using one NVIDIA H200.
 
-The code is derived from [snap-stanford/relational-transformer](https://github.com/snap-stanford/relational-transformer) with the inspiration of [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt).
+The current record is **309 seconds (5m09s)**. It combines:
 
-The current record beats the baseline in **7m 26s** with the following techniques:
+- [Muon](https://github.com/KellerJordan/Muon) for matrix parameters, with AdamW
+  for embeddings, biases, normalization parameters, and SIGReg projectors;
+- column-view [SIGReg](SIGREG.md) at the first transformer block;
+- relation-conditioned trilinear neighbor attention, called *simplicial
+  attention* in the implementation;
+- a static text-derived relation stream and per-head QK normalization.
 
-* Replaced AdamW with [Muon](https://github.com/KellerJordan/Muon) (`muon_lr=5e-3`) for all matrix parameters, keeping AdamW for embeddings and biases.
-* Added **SIGReg column-view** geometry regularization on the first block (`sigreg_layer=0`, `sigreg_lambda_col=1e-3`, global column pooling), which de-collapses the early per-feature representation. Training-only — adds zero inference cost.
+The code is derived from the
+[Relational Transformer](https://arxiv.org/abs/2510.06377) and follows the open
+record-lineage style of
+[modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt) and
+[Speedrunning Tabular Foundation Model Pretraining](https://arxiv.org/abs/2606.03681).
 
-The following techniques were evaluated but did not lead to improvements:
+## Leaderboard
 
-* SIGReg **row-view** (`sigreg_lambda_row`): regularizes the post-aggregation relation stream (`dr`), which is the wrong stream — it did not improve over the column-only variant and destabilized training at larger λ.
+All entries use the same H200 hardware class, five-database training mixture,
+frozen `rel-avito` validation artifact, pooled AUROC implementation, target, and
+historical `TrainTimer` boundary.
 
+| # | Time to target | Date | Incremental recipe | Contributor |
+|---:|---:|---:|---|---|
+| 1 | 45m00s | baseline | AdamW Relational Transformer | — |
+| 2 | 12m27s | 2026-05-05 | + Muon | Gabriel Veloso |
+| 3 | 7m26s | 2026-06-24 | + column-view SIGReg | Gabriel Veloso |
+| 4 | **5m09s (309 s)** | 2026-07 | + relation-conditioned trilinear neighbor attention | Gabriel Veloso |
 
-## Running the current record
+Record #4 is **1.44× faster** than record #3 and **8.74× faster** than the
+45-minute baseline under the historical timing rule.
+
+### Initialization audit
+
+The record configuration also has a strong initialization prior. A diagnostic
+run measured pooled AUROC `0.8651` at step 0, before any optimizer update. nanoRT
+therefore logs step 0 outside the timer, prevents it from selecting a checkpoint
+or record, and reports post-initialization gains separately. The official 309 s
+entry is the first eligible post-update evaluation under the frozen leaderboard
+rule; the paper must report `AUROC@0` alongside time-to-target.
+
+This distinction matters: nanoRT measures **time to a verified solution under a
+fixed protocol**, not pure optimizer convergence time.
+
+## Reproduce record #4
+
+Requirements:
+
+- Linux x86-64;
+- one NVIDIA H200 with a CUDA 12.4-compatible driver;
+- access to the public nanoRT artifact repository;
+- [pixi](https://pixi.sh/).
 
 ```bash
-git clone https://github.com/gabrielmveloso/Modded-NanoRT.git
-cd Modded-NanoRT
-pixi install
-cd rustler && pixi run maturin develop --uv --release && cd ..
-
-pixi run hf download gabrielveloso/nanort-artifacts \
-    --repo-type dataset \
-    --include "holdout-rel-avito/*" \
-    --local-dir ~/scratch/nanort_artifacts
-
-mkdir -p ~/scratch/pre
-ln -sf ~/scratch/nanort_artifacts/holdout-rel-avito/train ~/scratch/pre/nanort-train-rel-avito
-ln -sf ~/scratch/nanort_artifacts/holdout-rel-avito/val/rel-avito ~/scratch/pre/nanort-val-rel-avito
-
+git clone https://github.com/kunumi/nanoRT.git
+cd nanoRT
 ./run.sh
 ```
 
-Note: `torch.compile` of the flex-attention masks adds ~3 minutes on the first run. This is untimed.
+`run.sh` installs the locked environment, builds the Rust sampler, downloads the
+relation-aware holdout artifact, creates the expected per-database links, and
+starts the record configuration. Override settings through environment variables:
 
+```bash
+NANORT_SEED=1 \
+WANDB_PROJECT=nanort-reproduction \
+HF_REPO=gabrielveloso/nanort-artifacts \
+HF_REVISION=YOUR_IMMUTABLE_COMMIT_SHA \
+./run.sh
+```
 
-## Record history
+The record defaults are centralized in [`rt/config.py`](rt/config.py) and mirrored
+by [`plx_nanort_train.yaml`](plx_nanort_train.yaml):
 
-The following is the historical progression of speed records for the following task:
+| setting | value |
+|---|---:|
+| optimizer | Muon + AdamW |
+| `muon_lr` | `5e-3` |
+| `muon_warmup_steps` | `3000` |
+| SIGReg | layer `0`, column `1e-3`, global pooling |
+| simplicial layers | all 12 blocks |
+| relation stream | static (`update_relations=0`) |
+| QK norm | enabled |
+| batch size / sequence length | `256` / `1024` |
+| official eval cadence | every `100` steps |
+| step 0 / step 1 eval | diagnostic on / official off |
+| maximum timed budget | 45 minutes |
 
-> *Train a Relational Transformer to ≥0.81621 zero-shot AUROC on `rel-avito` using 1× NVIDIA H200, within 45 minutes of active training time.*
+For an ablation, override only the relevant variable. Examples:
 
-The 0.81621 target was selected to match the baseline calibration run over the upstream [snap-stanford/relational-transformer](https://github.com/snap-stanford/relational-transformer) code.
+```bash
+# Remove the simplicial path.
+NANORT_SIMPLICIAL_LAYERS=none ./run.sh
 
-| #  | Record            | Date       | Description              | Links                      | Contributors     |
-| -- | ----------------- | ---------- | ------------------------ | -------------------------- | ---------------- |
-| 1  | 0.81621 AUROC @ 45 min | TBD   | Baseline                 | [log](records/01_baseline) |                  |
-| 2  | 12m 27s           | 2026-05-05 | Muon optimizer (`muon_lr=5e-3`) | [log](records/02_muon) | Gabriel Veloso   |
-| 3  | **7m 26s**        | 2026-06-24 | Muon + SIGReg col-view (`sigreg_layer=0`, `λ_col=1e-3`) | [log](records/03_sigreg) | Gabriel Veloso   |
+# Keep the architecture but update the relation stream between blocks.
+NANORT_UPDATE_RELATIONS=1 ./run.sh
 
+# Disable SIGReg.
+NANORT_SIGREG_LAYER=-1 NANORT_SIGREG_LAMBDA_COL=0 ./run.sh
+```
 
-## Rules
+## What the model does
 
-New records must:
-* Not modify the val artifact (seeds, embeddings, 3-hop extraction radius).
-* Not modify the training mix (same 5 databases, same α=0.3 mixing, no `rel-avito`).
-* Not use `rel-avito` data in any form during training.
-* Attain ≥0.81621 mean val AUROC at the 45-minute mark (p<0.01 over multiple seeds).
-* Run on 1× H200, with active training time measured by `rt/main.py`'s `TrainTimer`.
+RT samples a temporally valid relational neighborhood around each seed row,
+masks the target cell, and encodes cell values together with table, column, and
+relation text metadata. The model alternates schema-aware attention patterns and
+predicts the masked value with a shared backbone.
 
-Other than that, anything and everything is fair game!
+The new sparse neighbor operator scores a parent query `q`, child-cell key `k`,
+and relation key `r` jointly:
 
+```text
+score(q, k, r) = sum_d q_d * k_d * r_d
+value(v, r)    = v * r
+```
 
-## Evaluation details
+It is a factorized trilinear/FiLM interaction over typed foreign-key edges, not
+an explicit simplicial complex. See
+[`docs/simplicial_relational_attention.md`](docs/simplicial_relational_attention.md)
+for the data flow, sparse edge representation, and controls.
 
-Evaluation is zero-shot AUROC on the `rel-avito` validation seeds.
+## Evaluation protocol
 
-* Val set: `rel-avito` mini-database, seeds from `Val` split, capped at 50 000 seeds, extracted at `max_hops=3`.
-* Seeds, hops, and embeddings are frozen for all submissions.
-* Metric: mean AUROC across `rel-avito` binary-classification tasks, averaged over the val seeds.
+### Official metric
 
+The callback concatenates predictions and labels from the eligible binary
+`rel-avito` tasks and calls `roc_auc_score` once. This is **pooled
+instance-level AUROC**, not macro or mean per-task AUROC.
+
+Equivalently, it is the probability that a positive drawn from the complete
+empirical validation population is scored above a negative, with half credit for
+ties. This makes within-task ranking and cross-task score alignment part of the
+official estimand. The metric remains fixed to preserve the historical record
+lineage.
+
+Every evaluation additionally logs:
+
+- AUROC and prevalence for each task;
+- unweighted macro AUROC;
+- exact within-task and cross-task pair contributions;
+- a task-prior oracle diagnostic;
+- score duplication and positive/negative tie rates;
+- evaluation duration and the step-0 baseline.
+
+Only `val/auroc_pooled`—also logged under the historical key
+`val/auroc_zero_shot`—can trigger the target.
+
+### Timer
+
+The historical timer starts immediately **after the first optimizer update**.
+Compilation, compile warm-up, and step-0 evaluation are untimed. Once started,
+the timer is wall-clock time and includes subsequent data loading, scheduled
+validation, logging, and checkpoint overhead. This boundary is intentionally
+preserved for leaderboard comparability; separate timing metrics expose its
+components for the paper.
+
+Because evaluation is discrete, time-to-target is the timestamp of the first
+eligible evaluation at or above `0.81621`. It should not be interpreted with
+precision finer than the evaluation cadence.
+
+### Step 0
+
+Step 0 evaluates the initialized model before any optimizer update. It:
+
+- runs outside the official timer;
+- cannot trigger `train/time_to_target`;
+- cannot select or save the best checkpoint;
+- measures architectural/schema priors and enables `AUROC(t) - AUROC(0)`.
+
+## Holdout guarantee
+
+For a `rel-avito` run, the training artifact contains exactly the other five
+eligible databases: `rel-amazon`, `rel-hm`, `rel-stack`, `rel-trial`, and
+`rel-f1`. The entry point fails if the resolved training set differs or includes
+the holdout. Validation loads only the frozen `rel-avito` artifact.
+
+The Rust sampler enforces temporal cutoffs, masks the prediction target, and
+removes declared leakage columns. Seeds, three-hop extraction, schema text
+embeddings, and the validation artifact are frozen across records.
+
+Both launchers resolve the requested HuggingFace revision to an immutable commit
+before downloading. That revision, the Git commit and dirty-state flag, Python,
+PyTorch/CUDA, and GPU identity are stored in the W&B run config. Paper
+reproductions should pass the recorded artifact commit through `HF_REVISION` (or
+the equivalent Polyaxon input), rather than relying on a mutable `main` branch.
+
+`rel-avito` is a **gradient holdout and zero-shot development domain**. Because
+its validation results have guided repeated engineering decisions, it should not
+be described as a statistically untouched test set.
+
+## Tests and validation
+
+CPU-only protocol tests:
+
+```bash
+python -m pytest tests
+```
+
+Full environment checks:
+
+```bash
+pixi install --locked
+pixi run python -m pytest
+pixi run python -m compileall -q rt scripts tests
+pixi run cargo test --manifest-path rustler/Cargo.toml
+bash -n run.sh
+```
+
+The H200 run remains the required integration test for `torch.compile`, bf16,
+the Rust sampler, sparse scatter kernels, and the exact timing result.
+
+## Paper material
+
+- [Paper execution plan](docs/PAPER_EXECUTION_PLAN.md)
+- [Introduction and Related Work draft](docs/PAPER_DRAFT.md)
+- [Simplicial attention design](docs/simplicial_relational_attention.md)
+- [SIGReg implementation](SIGREG.md)
+- [Ablation and metric audit](docs/ABLATION_PLAN.md)
 
 ## References
 
-1. [Robinson et al. RelBench: A Benchmark for Deep Learning on Relational Databases. NeurIPS 2024.](https://arxiv.org/abs/2407.20060)
-2. [Ranjan et al. Relational Transformer. snap-stanford, 2024.](https://github.com/snap-stanford/relational-transformer)
-3. [Reimers & Gurevych. Sentence-BERT. EMNLP 2019.](https://arxiv.org/abs/1908.10084)
-4. [Jordan et al. modded-nanogpt. 2024–2026.](https://github.com/KellerJordan/modded-nanogpt)
-5. [Müller et al. modded-nanotabpfn. 2026.](https://github.com/borawhocodess/modded-nanotabpfn)
+1. [Robinson et al. RelBench: A Benchmark for Deep Learning on Relational Databases.](https://arxiv.org/abs/2407.20060)
+2. [Ranjan et al. Relational Transformer: Toward Zero-Shot Foundation Models for Relational Data.](https://arxiv.org/abs/2510.06377)
+3. [Ozturk et al. Speedrunning Tabular Foundation Model Pretraining.](https://arxiv.org/abs/2606.03681)
+4. [Pfefferle et al. nanoTabPFN.](https://arxiv.org/abs/2511.03634)
+5. [Jordan et al. modded-nanoGPT and Muon.](https://github.com/KellerJordan/modded-nanogpt)

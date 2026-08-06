@@ -24,6 +24,7 @@ pub enum TableType {
 pub struct Edge {
     pub node_idx: i32,
     pub table_name_idx: i32,
+    pub relation_text_idx: i32,
     pub table_type: TableType,
     pub timestamp: Option<i32>,
 }
