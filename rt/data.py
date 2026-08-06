@@ -10,8 +10,9 @@ from functools import cache
 import ml_dtypes
 import numpy as np
 import torch
-from rustler import Sampler
 from torch.utils.data import Dataset
+
+from rustler import Sampler
 
 
 @cache
@@ -55,7 +56,9 @@ def _load_relation_text_idxs(db_name: str) -> tuple[int, ...]:
 
 
 @cache
-def _load_text_embeddings(db_name: str, embedding_model: str, d_text: int) -> np.ndarray:
+def _load_text_embeddings(
+    db_name: str, embedding_model: str, d_text: int
+) -> np.ndarray:
     home = os.environ.get("HOME", ".")
     emb_path = os.path.join(
         home, "scratch", "pre", db_name, f"text_emb_{embedding_model}.bin"

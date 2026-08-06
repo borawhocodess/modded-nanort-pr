@@ -7,22 +7,26 @@ from torch import nn
 
 def _empty_rel_batch(B, S, device, valid_fk_slots):
     empty = torch.empty(0, device=device, dtype=torch.long)
-    return dict(
-        seg_q=empty,
-        bs_t=empty,
-        seg_r=empty,
-        r_t=empty,
-        B=B,
-        S=S,
-        T=0,
-        valid_fk_slots=valid_fk_slots,
-        matched_fk_slots=0,
-    )
+    return {
+        "seg_q": empty,
+        "bs_t": empty,
+        "seg_r": empty,
+        "r_t": empty,
+        "B": B,
+        "S": S,
+        "T": 0,
+        "valid_fk_slots": valid_fk_slots,
+        "matched_fk_slots": 0,
+    }
 
 
 @torch.compiler.disable
 def build_rel_batch(
-    f2p_nbr_idxs, f2p_rel_idxs, node_idxs, is_padding, num_relations,
+    f2p_nbr_idxs,
+    f2p_rel_idxs,
+    node_idxs,
+    is_padding,
+    num_relations,
     need_stats=False,
 ):
     """Build sparse edge triples for relation-aware simplicial attention.
@@ -47,11 +51,7 @@ def build_rel_batch(
     B, S, _ = f2p_nbr_idxs.shape
     device = f2p_nbr_idxs.device
 
-    valid_sk = (
-        (f2p_nbr_idxs != -1)
-        & (f2p_rel_idxs != -1)
-        & ~is_padding[:, :, None]
-    )
+    valid_sk = (f2p_nbr_idxs != -1) & (f2p_rel_idxs != -1) & ~is_padding[:, :, None]
 
     b_e, s_e, k_e = valid_sk.nonzero(as_tuple=True)
     b_q, q_pos = (~is_padding).nonzero(as_tuple=True)
@@ -104,17 +104,17 @@ def build_rel_batch(
     s_t = s_e[edge_rep]
     r_t = rel_e[edge_rep]
 
-    return dict(
-        seg_q=b_t * S + q_t,
-        bs_t=b_t * S + s_t,
-        seg_r=b_t * num_relations + r_t,
-        r_t=r_t,
-        B=B,
-        S=S,
-        T=total,
-        valid_fk_slots=valid_fk_slots,
-        matched_fk_slots=matched_fk_slots,
-    )
+    return {
+        "seg_q": b_t * S + q_t,
+        "bs_t": b_t * S + s_t,
+        "seg_r": b_t * num_relations + r_t,
+        "r_t": r_t,
+        "B": B,
+        "S": S,
+        "T": total,
+        "valid_fk_slots": valid_fk_slots,
+        "matched_fk_slots": matched_fk_slots,
+    }
 
 
 def _scatter_softmax(logits, seg, n_segs):
@@ -134,6 +134,19 @@ def _scatter_softmax(logits, seg, n_segs):
     denom = logits.new_zeros(n_segs, H)
     denom.index_add_(0, seg, exp_l)
     return exp_l / denom.index_select(0, seg).clamp(min=1e-8)
+
+
+def _mean_segment_entropy(attn, seg, n_segs):
+    """Mean categorical entropy over active sparse segments and heads."""
+    entropy_terms = -(attn.clamp(min=1e-8).log() * attn)
+    entropy_by_segment = attn.new_zeros(n_segs, attn.shape[1])
+    entropy_by_segment.index_add_(0, seg, entropy_terms)
+    counts = attn.new_zeros(n_segs)
+    counts.index_add_(0, seg, attn.new_ones(seg.shape[0]))
+    active = counts > 0
+    return (entropy_by_segment * active[:, None]).sum() / (
+        active.sum() * attn.shape[1]
+    ).clamp(min=1)
 
 
 class SimplicialNbrAttn(nn.Module):
@@ -189,7 +202,7 @@ class SimplicialNbrAttn(nn.Module):
             out.index_add_(0, seg_q, out_vals)
 
             if need_stats:
-                attn_entropy = -(attn.clamp(min=1e-8).log() * attn).mean()
+                attn_entropy = _mean_segment_entropy(attn, seg_q, B * S)
 
         return self.wo(out.view(B, S, H * D)), attn_entropy
 
@@ -240,6 +253,6 @@ class RelAttn(nn.Module):
             out.index_add_(0, seg_r, out_vals)
 
             if need_stats:
-                attn_entropy = -(attn.clamp(min=1e-8).log() * attn).mean()
+                attn_entropy = _mean_segment_entropy(attn, seg_r, B * R)
 
         return self.wo(out.view(B, R, H * D)), attn_entropy

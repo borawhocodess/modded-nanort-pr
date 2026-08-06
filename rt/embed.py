@@ -61,7 +61,7 @@ def main(
         else:
             device = "cpu"
             print("No CUDA devices available, using CPU")
-    
+
     if isinstance(device, list):
         device_type = torch.device(device[0]).type
     else:
@@ -77,10 +77,7 @@ def main(
         embedding_model=embedding_model,
         device_type=device_type,
     )
-    emb_list = text_embedder(
-        text_list,
-        device=device
-    )
+    emb_list = text_embedder(text_list, device=device)
 
     emb_path = f"{os.environ['HOME']}/scratch/pre/{dataset_name}/text_emb_{embedding_model}.bin"
     emb = np.stack(emb_list).astype(bfloat16)

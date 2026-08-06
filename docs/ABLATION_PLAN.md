@@ -1,5 +1,12 @@
 # Plano de ablation — v3 (avaliado contra o código atual)
 
+> **Status:** auditoria interna, com resultados históricos preservados. A decisão
+> de protocolo tomada em 6 de agosto de 2026 mantém o **pooled instance-level
+> AUROC** como métrica oficial do leaderboard. Macro/per-task e a decomposição
+> within/cross são diagnósticos obrigatórios. Quando as seções históricas abaixo
+> propõem trocar a primária, prevalece o plano atual em
+> [`PAPER_EXECUTION_PLAN.md`](PAPER_EXECUTION_PLAN.md).
+
 Revisão do plano v2 contra `simplicial_sigreg_new` @ `f29b46e`. Três achados no
 código mudam a ordem das fases; um deles muda o objeto do estudo.
 
@@ -7,9 +14,9 @@ código mudam a ordem das fases; um deles muda o objeto do estudo.
 
 ## Parte I — O que o código diz antes de qualquer run
 
-### 1. A métrica reportada não é a métrica definida (bloqueante)
+### 1. A métrica era descrita com o nome errado
 
-`README.md:71` define o alvo:
+O `README.md` na época desta auditoria definia o alvo como:
 
 > Metric: **mean AUROC across `rel-avito` binary-classification tasks**, averaged over the val seeds.
 
@@ -56,10 +63,9 @@ Nota: o caminho de código que computa AUROC **por tarefa** já existe
 ([main.py:654-665](../rt/main.py#L654-L665)), mas `eval_tasks=[]`
 ([nanort_train.py:61](../scripts/nanort_train.py#L61)) e ele nunca roda.
 
-Nota 2: se a calibração que produziu 0.81621 usou o mesmo pooled, os records 2 e 3
-seguem **comparáveis entre si** e o speedrun continua internamente válido. O que cai
-é a *interpretação* ("transferência relacional zero-shot"), não necessariamente o
-ranking. Verificar `records/01_baseline` antes de afirmar qualquer coisa.
+Como a calibração e toda a linhagem usaram o mesmo pooled, os records permanecem
+comparáveis. O README atual nomeia o estimando corretamente e exige a decomposição
+para limitar sua interpretação.
 
 ### 2. O reenquadramento "aprendido vs. init" já está escrito no código
 
@@ -74,15 +80,16 @@ Ou seja: **AUROC ≈ 0.87 no step 1 já é fato conhecido e documentado**, e o f
 central do plano v2 (§"o confound primário é aprendido vs. no init") não precisa ser
 testada — está confirmada no repositório.
 
-Pior: o default do YAML é `eval_at_step1: "1"`
-([plx_nanort_train.yaml:171](../plx_nanort_train.yaml#L171)). E `timer.start()` roda
-**antes** do callback ([main.py:849-859](../rt/main.py#L849-L859)), então com o default
-ligado `time_to_target` ≈ duração de um eval. Auditar qual valor o run do record usou.
+No commit auditado, o default do YAML era `eval_at_step1: "1"`. Como
+`timer.start()` roda antes do callback, isso fazia `time_to_target` ficar próximo
+da duração de um eval. O protocolo atual corrige o default para
+`eval_at_step1: "0"`; o recorde #4 informado (309 s) usa o primeiro eval elegível
+no step 100. A run de 154 s abaixo é mantida apenas como diagnóstico de latência.
 
-Consequência: `time_to_target` neste branch mede **latência de infraestrutura**
-(compile das flex masks — o próprio README diz ~3 min não-cronometrados — + download +
-primeiro eval) e o *gap de 100 steps* do `val_eval_freq`. Não mede velocidade de
-aprendizado. Isso precisa ser redefinido antes de ir pro paper.
+Consequência: `time_to_target` mistura treino e infraestrutura **dentro da
+fronteira histórica do timer**, em especial avaliação e logging. O paper preserva
+essa regra para comparabilidade, mas reporta os componentes e `AUROC@0`
+separadamente.
 
 Quanto os pesos andam até o step 25: Muon com warmup 3000 → LR(25) = 25/3000·5e-3 =
 4.2e-5. E `enc_dict`/`dec_dict`/`mask_embs`/normas/LayerScale caem **todos** no grupo
@@ -127,9 +134,9 @@ defensivo de [model.py:357-358](../rt/model.py#L357-L358) é no-op hoje.
 
 ## Parte III — Plano revisado
 
-Métrica primária **redefinida** para toda a série: `mean_per_task_AUROC` — a métrica
-do README. `pooled_AUROC` é reportado ao lado, rotulado como *métrica legada do
-speedrun*, para manter comparabilidade com os records 2 e 3.
+Métrica oficial preservada para toda a série: `pooled_AUROC`. A análise deve sempre
+reportar `mean_per_task_AUROC` e a decomposição within/cross ao lado, sem usá-las para
+alterar retroativamente a elegibilidade do leaderboard.
 
 ### Fase 0 — Decomposição da métrica e do init (nenhum treino)
 
@@ -145,16 +152,17 @@ plumbing novo. Logado por eval:
 
 - `val/auroc_zero_shot` — pooled, **intocado**: é contra ele que os records e o
   `time_to_target` são medidos
-- `val/auroc/<task>` e `val/auroc_mean_per_task` ← **primária** (a métrica do README)
+- `val/auroc/<task>` e `val/auroc_mean_per_task` ← diagnóstico macro
 - `val/base_rate/<task>`, `val/n_pos/<task>`, `val/n_neg/<task>`
 - `val/auroc_between` — fórmula fechada acima, teto de base-rate puro
 - `val/auroc_pooled_within`, `val/auroc_pooled_cross`, `val/pooled_cross_weight` —
   split **exato** do pooled: como AUROC é uma média de Mann-Whitney sobre pares
   (positivo, negativo), ela fatora sobre a tarefa de origem de cada elemento, e vale a
   identidade `pooled = (1−cw)·within + cw·cross` (verificada no teste a 1e-9).
-  `cross_weight` é a fração da métrica reportada que repousa em pares **entre** tarefas —
-  comparações que o benchmark nunca pede. Nas contagens de val do avito, `cw ≈ 0.72`.
-- `val/pred_tie_frac`, `val/pred_unique` — piso de ruído do bf16
+  `cross_weight` é a fração da métrica reportada que repousa em pares **entre** tarefas,
+  parte deliberada do estimando global. Nas contagens de val do avito, `cw ≈ 0.86`.
+- `val/pred_pos_neg_tie_rate`, `val/pred_duplicate_fraction`, `val/pred_unique` —
+  quantização/empates do bf16
 - `val/n_tasks`, `val/n_unmapped_tasks` — se o mapa de id falhar, o split continua
   correto (agrupa pelo id observado), só sem nome resolvido
 
@@ -165,11 +173,12 @@ onde o sinal intra-tarefa era idêntico nos dois grupos. Sem interpretação; su
 pelo split exato de Mann-Whitney.
 
 Custo GPU: um eval. **Gate G0**: se `auroc_mean_per_task ≪ auroc_zero_shot ≈
-auroc_between`, o "0.87 zero-shot" é separação de base rate e as Fases 2–4 mudam de
-objeto — passam a medir efeito sobre `auroc_mean_per_task`, que pode estar em ~0.5.
+auroc_between`, manter o recorde pooled, mas atribuir separadamente alinhamento
+cross-task e discriminação within-task nas Fases 2–4.
 
-Como obter a leitura sem gastar 45 min: `eval_at_step1=1` (default do YAML) + `max_steps`
-pequeno já entrega a decomposição no step 1, que é ~init.
+Como obter a leitura sem gastar 45 min: habilitar explicitamente
+`eval_at_step1=1` + `max_steps` pequeno entrega a decomposição no step 1, que é
+próximo do init. Esse não é o default nem uma run elegível para o leaderboard.
 
 #### Resultado — G0 FECHADO
 
@@ -191,7 +200,7 @@ contra um negativo de `user-clicks`, que o benchmark nunca pede.
 
 **A curva (`deft-totem-3`):**
 
-| step | pooled | mean/task | visits | clicks | within | cross | tie_frac | mtp_loss |
+| step | pooled | mean/task | visits | clicks | within | cross | duplicate frac. (log histórico) | mtp_loss |
 |---|---|---|---|---|---|---|---|---|
 | 1  | 0.3257 | 0.5264 | 0.5100 | 0.5427 | 0.5153 | 0.2938 | 0.966 | 0.7045 |
 | 10 | 0.3330 | 0.5334 | 0.5197 | 0.5471 | 0.5242 | 0.3009 | 0.965 | 0.7035 |
@@ -207,8 +216,8 @@ Decompondo o ganho de 50 steps pela identidade exata:
   within = 0.144 · (0.5925 − 0.5153) = 0.0111   ←  2.5% do ganho
 ```
 
-**97.5% do que o modelo "aprende" na métrica reportada é ordenar as duas tarefas,
-não prever `num_click`.** E há confirmação mecânica independente: `tie_frac` sobe de
+**97.5% do ganho na métrica reportada vem da ordenação entre as duas tarefas.** Há
+confirmação mecânica independente: a fração histórica de scores duplicados sobe de
 0.966 para 0.989 e `mtp_loss` *sobe* de 0.700 (step 25) para 0.767 — o modelo está
 colapsando as predições em dois níveis, um por coluna-alvo, que é exatamente a
 solução que maximiza o pooled sem aprender nada relacional.
@@ -220,7 +229,7 @@ real, e é 0.58, não 0.87.
 
 **Ruído de medida (0.3, de graça pelas réplicas):** deltas de **2–5·10⁻⁴** em todos
 os AUROCs entre `earthy-sea-1` e `golden-deluge-2`. Contagens, `base_rate`,
-`cross_weight`, `pred_tie_frac` e `pred_unique` bit-idênticos → o subgrafo de val
+`cross_weight`, a duplicação de scores e `pred_unique` bit-idênticos → o subgrafo de val
 está pinado, confirmado; o resíduo é o `index_add_` atômico. Piso de ruído de kernel
 muito melhor que o temido: ~5·10⁻⁴. **O SE amostral de `user-clicks` (0.018) é a
 restrição real de poder, não o kernel.**
@@ -285,6 +294,10 @@ gradiente.** O 0.87 do doc está inteiro no init — 0.8651 antes de treinar, 0.
 step 25. E `train/time_to_target` = **154 s**, disparado no step 1, que é exatamente
 a duração de um eval (155 s medidos). Nesta config o "record" é um eval.
 
+O **recorde oficial #4 é 309 s**, em uma run com `eval_at_step1=0` e primeiro eval
+elegível no step 100. O número de 154 s acima pertence ao diagnóstico com step 1
+ligado e não substitui o leaderboard.
+
 Resposta à pergunta que estava aberta — o `within` do 0.87 é **0.568**, não 0.75.
 O ganho de 25 steps no pooled é +0.0102, e 86% dele ainda é `cross`
 (0.144·0.0095 + 0.856·0.0103 = 0.0102, identidade fechando). `cross` no step 25 é
@@ -314,10 +327,10 @@ treino somam +0.007. Isso é o "paper 2" da lista: um baseline *training-free*.
 loader inteiro. Reduzir de verdade exige capar o número de batches, ao custo de
 variância — e com n⁺ = 745 em `user-clicks` o SE já é 0.018, então não há espaço.
 
-**0.2 — `AUROC@0` e sua distribuição sobre seeds.** Uma linha para habilitar
-(`val_callback.step(0, net)` antes do loop de treino; `0 % eval_every == 0` já passa o
-guard de [main.py:107](../rt/main.py#L107)), mais um flag para impedir
-`time_to_target` de disparar no step 0. Forward-only, ~1 min por seed, **20 seeds**:
+**0.2 — `AUROC@0` e sua distribuição sobre seeds.** O logging de step 0 já está
+implementado e impedido por construção de disparar `time_to_target` ou selecionar
+checkpoint. Resta executar a distribuição forward-only, ~1 min por seed,
+**20 seeds**:
 
 - distribuição de `AUROC@0` (pooled e per-task), com **sinal**: fração de seeds com AUROC < 0.5
 - variante *head-only*: fixar a seed do backbone e variar só `dec_dict`/`mask_embs`
@@ -353,12 +366,12 @@ achado, e a Fase 3 só vale para confirmar o nulo com 1–2 arms.
 `simplicial/r_table_size`, `active_relation_types`, `active_relation_type_frac`,
 `parent_match_rate`, `edge_count`. Zero compute.
 
-### Fase 1 — Protocolo (pré-registro)
+### Fase 1 — Protocolo
 
-- **Primária**: `mean_per_task_AUROC @ K`, com `K` fixo pré-registrado. Escolher `K` a
-  partir da curva do champion, **não** por arm.
+- **Oficial**: pooled AUROC e `time_to_target` histórico. Como diagnósticos de
+  atribuição, reportar `mean_per_task_AUROC @ K` e within/cross em `K` fixo.
 - Reportar sempre o quarteto: `@0` · `@K` · `@peak` (rotulado *oráculo*) · `t2t`
-  (rotulado *inclui startup*), mais `pooled` legado.
+  (rotulado com sua fronteira temporal), mais a decomposição do pooled.
 - **Pareamento**: mesma seed, mesma ordem de dados, mesmo stream de init entre arms;
   reportar diferenças pareadas. Com 3 seeds isso é a diferença entre ter e não ter poder.
 - **Variância**: eval (SE analítico + empates do bf16), seed (spread), kernel
@@ -445,11 +458,12 @@ só `∂L/∂nbr_scale ≠ 0`. Sai do zero, mas devagar. Usar `1e-2` em vez de `
 adicional para não confundir "não ajuda" com "não treina" (é o mesmo modo de falha que o
 commit `430b5d4` já corrigiu no `RelAttn`).
 
-### Fase 5 — Custo e redefinição do `t2t`
+### Fase 5 — Custo e decomposição do `t2t`
 
 - Fronteira `mean_per_task_AUROC @ K` × `s/step`.
 - AUROC sob budget fixo de 45 min de wall-clock, fiel à competição.
-- **Redefinir `t2t`**: reportar `t2t_total` (atual) decomposto em `startup`
+- **Decompor, sem redefinir retroativamente**: reportar o `t2t` histórico junto de
+  `startup`
   (download + build rustler + compile das flex masks, ~3 min pelo README) +
   `train` + `eval_overhead` (os evals contam no `TrainTimer`). E reportar
   `AUROC@0` ao lado, para expor quanto do `t2t` é a rede nem ter treinado.
@@ -487,8 +501,9 @@ esses três não encerrarem a discussão.
 
 ## Disciplina estatística
 
-Pré-registrar antes de rodar: `K`, lista de arms, métrica primária
-(`mean_per_task_AUROC`), efeito mínimo detectável vindo de 0.3, e os gates G0/G1. Com
+Pré-registrar antes de rodar: `K`, lista de arms, métrica primária oficial
+(`pooled_AUROC`), métricas diagnósticas de atribuição (`mean_per_task_AUROC` e
+within/cross), efeito mínimo detectável vindo de 0.3, e os gates G0/G1. Com
 ~20 arms e picos de oráculo, vencedores espúrios são garantidos. Tudo fora do
 pré-registro é exploratório e vai rotulado como tal.
 

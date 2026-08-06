@@ -9,14 +9,12 @@ Run:
 """
 
 import json
-import os
+from pathlib import Path
 
 from rt.config import TrainConfig
-from rt.main import main
 from rt.tasks import autocomplete_clf_tasks, forecast_clf_tasks
 
-HOME = os.environ["HOME"]
-PRE = os.path.join(HOME, "scratch", "pre")
+PRE_ROOT = Path.home() / "scratch" / "pre"
 
 HOLDOUT_CANDIDATES = [
     "rel-amazon",
@@ -40,18 +38,28 @@ def clf_tasks_for_db(db_name: str):
 def resolve_tasks(cfg: TrainConfig) -> TrainConfig:
     """Fill cfg.train_tasks / cfg.val_tasks from cfg.holdout_db and validate that
     the required preprocessed artifacts are present. Returns the same cfg."""
-    assert cfg.holdout_db in HOLDOUT_CANDIDATES, f"Unknown holdout: {cfg.holdout_db}"
-    assert cfg.optimizer in ("adamw", "muon"), f"Unknown optimizer: {cfg.optimizer}"
+    cfg.validate()
+    if cfg.holdout_db not in HOLDOUT_CANDIDATES:
+        raise ValueError(
+            f"Unknown holdout {cfg.holdout_db!r}; expected one of {HOLDOUT_CANDIDATES}"
+        )
 
     train_dbs = [db for db in HOLDOUT_CANDIDATES if db != cfg.holdout_db]
+    train_artifact_paths = set()
     for db in train_dbs:
-        db_path = os.path.join(PRE, db)
-        if not os.path.isdir(db_path):
+        db_path = PRE_ROOT / db
+        if not db_path.is_dir():
             raise FileNotFoundError(
                 f"Train artifact not found at {db_path}.\n"
                 f"Build it first: plx_nanort_build_upload_relations_holdout.yaml "
                 f"--holdout {cfg.holdout_db}"
             )
+        train_artifact_paths.add(db_path.resolve())
+    if len(train_artifact_paths) != len(train_dbs):
+        raise RuntimeError(
+            "Holdout isolation failed: two training database names resolve to "
+            "the same physical artifact"
+        )
 
     cfg.train_tasks = [
         (db, table, target, drop)
@@ -60,14 +68,28 @@ def resolve_tasks(cfg: TrainConfig) -> TrainConfig:
     ]
     cfg.eval_tasks = []
 
-    val_artifact_path = os.path.join(PRE, cfg.holdout_db)
-    if not os.path.isdir(val_artifact_path):
+    observed_train_dbs = {task[0] for task in cfg.train_tasks}
+    expected_train_dbs = set(train_dbs)
+    if cfg.holdout_db in observed_train_dbs or observed_train_dbs != expected_train_dbs:
+        raise RuntimeError(
+            "Holdout isolation failed: "
+            f"holdout={cfg.holdout_db}, train_dbs={sorted(observed_train_dbs)}, "
+            f"expected={sorted(expected_train_dbs)}"
+        )
+
+    val_artifact_path = PRE_ROOT / cfg.holdout_db
+    if not val_artifact_path.is_dir():
         raise FileNotFoundError(
             f"Val artifact not found at {val_artifact_path}.\n"
             f"Build it first: plx_nanort_build_upload_relations_holdout.yaml "
             f"--holdout {cfg.holdout_db}"
         )
-    with open(os.path.join(val_artifact_path, "table_info.json")) as f:
+    if val_artifact_path.resolve() in train_artifact_paths:
+        raise RuntimeError(
+            "Holdout isolation failed: the validation artifact resolves to a "
+            "training artifact path"
+        )
+    with (val_artifact_path / "table_info.json").open() as f:
         val_table_info = json.load(f)
 
     cfg.val_tasks = [
@@ -76,10 +98,12 @@ def resolve_tasks(cfg: TrainConfig) -> TrainConfig:
         if f"{table}:Val" in val_table_info
     ]
     if not cfg.val_tasks:
-        raise RuntimeError(
-            f"No val tasks found in {val_artifact_path}/table_info.json"
-        )
-    print(f"Val tasks ({len(cfg.val_tasks)}): {[t[1] for t in cfg.val_tasks]}", flush=True)
+        raise RuntimeError(f"No val tasks found in {val_artifact_path}/table_info.json")
+    if any(task[0] != cfg.holdout_db for task in cfg.val_tasks):
+        raise RuntimeError("Validation tasks must all belong to the held-out database")
+    print(
+        f"Val tasks ({len(cfg.val_tasks)}): {[t[1] for t in cfg.val_tasks]}", flush=True
+    )
     return cfg
 
 
@@ -87,14 +111,27 @@ def default_ckpt_dir(cfg: TrainConfig) -> str:
     tag = cfg.optimizer
     if cfg.optimizer == "muon":
         tag += f"-lr{cfg.muon_lr}"
-    if cfg.sigreg_layer is not None and (cfg.sigreg_lambda_row + cfg.sigreg_lambda_col) > 0:
+    if (
+        cfg.sigreg_layer is not None
+        and (cfg.sigreg_lambda_row + cfg.sigreg_lambda_col) > 0
+    ):
         tag += f"-sig-l{cfg.sigreg_layer}-c{cfg.sigreg_lambda_col}"
+    if cfg.simplicial_layers != []:
+        layers = (
+            "all"
+            if cfg.simplicial_layers is None
+            else "-".join(str(layer) for layer in cfg.simplicial_layers)
+        )
+        tag += f"-simp-{layers}"
     if not cfg.update_relations:
         tag += "-staticrel"
     return f"ckpts/nanort-{cfg.holdout_db}-{tag}-s{cfg.seed}"
 
 
 def run(cfg: TrainConfig) -> None:
+    # Keep the protocol/task resolver importable in CPU-only environments.
+    from rt.main import main
+
     resolve_tasks(cfg)
     if cfg.save_ckpt_dir is None:
         cfg.save_ckpt_dir = default_ckpt_dir(cfg)
@@ -106,7 +143,7 @@ if __name__ == "__main__":
     cfg = TrainConfig.from_env()
     try:
         run(cfg)
-    except BaseException:
+    except Exception:
         # Polyaxon pod logs vanish with the pod — persist the traceback in
         # wandb (if the run got that far) and flush it to stdout.
         import traceback
@@ -119,6 +156,6 @@ if __name__ == "__main__":
             if wandb.run is not None:
                 wandb.run.summary["crash_traceback"] = tb
                 wandb.finish(exit_code=1)
-        except Exception:
-            pass
+        except Exception as logging_error:  # noqa: BLE001 - preserve original crash
+            print(f"Failed to persist crash metadata: {logging_error}", flush=True)
         raise

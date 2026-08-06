@@ -15,12 +15,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
 import wandb
-
 
 DEFAULT_ENTITY = "franciscokunumi-universidade-federal-de-minas-gerais"
 DEFAULT_PROJECT = "nanort-sigreg-sweep"
@@ -45,11 +44,11 @@ def _int_config(config: dict, key: str, default: int | None = None) -> int | Non
 def _created_at(run) -> datetime:
     value = getattr(run, "created_at", None)
     if value is None:
-        return datetime.min.replace(tzinfo=timezone.utc)
+        return datetime.min.replace(tzinfo=UTC)
     if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-    # W&B commonly returns an ISO string ending in Z.
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    # Python 3.12 accepts W&B's ISO timestamps ending in ``Z`` directly.
+    return datetime.fromisoformat(str(value))
 
 
 def _norm_layer(config: dict) -> int:
@@ -112,7 +111,9 @@ def export(args: argparse.Namespace) -> pd.DataFrame:
     if not selected:
         raise RuntimeError(f"No matching runs found in {path}")
 
-    print(f"Matched {len(all_matches)} candidate runs; selected {len(selected)} latest runs")
+    print(
+        f"Matched {len(all_matches)} candidate runs; selected {len(selected)} latest runs"
+    )
     for key, run in sorted(selected.items()):
         print(f"  {key}: {run.name} state={run.state} created_at={run.created_at}")
 
@@ -164,7 +165,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--entity", default=DEFAULT_ENTITY)
     parser.add_argument("--project", default=DEFAULT_PROJECT)
-    parser.add_argument("--output", type=Path, default=Path("sigreg_latest_history.csv"))
+    parser.add_argument(
+        "--output", type=Path, default=Path("sigreg_latest_history.csv")
+    )
     parser.add_argument(
         "--lambdas",
         type=float,

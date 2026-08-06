@@ -25,7 +25,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-
 TARGET_AUROC = 0.81621
 BUDGET_SECONDS = 45 * 60
 
@@ -59,6 +58,25 @@ def load_history(path: Path) -> pd.DataFrame:
     if missing:
         raise ValueError(f"CSV is missing required columns: {missing}")
 
+    # Older sweep exports used ``sigreg/...``; the centralized training path
+    # now prefixes sampled train diagnostics with ``train/sigreg_...``. Keep a
+    # single analysis schema so historical and new runs can be plotted together.
+    metric_aliases = {
+        "sigreg/row": "train/sigreg_row",
+        "sigreg/col": "train/sigreg_col",
+        "sigreg/col/groups_valid": "train/sigreg_col/groups_valid",
+        "sigreg/col/groups_valid_frac": "train/sigreg_col/groups_valid_frac",
+        "sigreg/col/group_size_valid_mean": ("train/sigreg_col/group_size_valid_mean"),
+        "sigreg/col/cells_covered_frac": "train/sigreg_col/cells_covered_frac",
+        "sigreg/row/groups_valid": "train/sigreg_row/groups_valid",
+        "sigreg/row/groups_valid_frac": "train/sigreg_row/groups_valid_frac",
+        "sigreg/row/group_size_valid_mean": ("train/sigreg_row/group_size_valid_mean"),
+        "sigreg/row/cells_covered_frac": "train/sigreg_row/cells_covered_frac",
+    }
+    for historical, current in metric_aliases.items():
+        if historical not in df and current in df:
+            df[historical] = df[current]
+
     df["layer_clean"] = df["layer"].map(_clean_layer)
     df["config"] = [
         _config_label(layer, row, col)
@@ -66,9 +84,9 @@ def load_history(path: Path) -> pd.DataFrame:
     ]
     df["weighted_sigreg_row"] = df["lr_row"] * df.get("sigreg/row", np.nan)
     df["weighted_sigreg_col"] = df["lr_col"] * df.get("sigreg/col", np.nan)
-    df["weighted_sigreg_total"] = (
-        df["weighted_sigreg_row"].fillna(0.0) + df["weighted_sigreg_col"].fillna(0.0)
-    )
+    df["weighted_sigreg_total"] = df["weighted_sigreg_row"].fillna(0.0) + df[
+        "weighted_sigreg_col"
+    ].fillna(0.0)
     df["weighted_sup_loss"] = (
         1.0 - df["lr_row"].fillna(0.0) - df["lr_col"].fillna(0.0)
     ) * df.get("loss", np.nan)
@@ -101,9 +119,7 @@ def summarize_runs(df: pd.DataFrame, target: float) -> pd.DataFrame:
         else:
             time_to_target = inferred_hit_time
 
-        reached = (not pd.isna(time_to_target)) or (
-            len(hit_rows) > 0
-        )
+        reached = (not pd.isna(time_to_target)) or (len(hit_rows) > 0)
         has_final_censor = bool((ttt < 0).any())
         max_auroc = _metric_max(g.get("val/auroc_zero_shot", pd.Series(dtype=float)))
         if len(val):
@@ -187,9 +203,11 @@ def dedupe_runs(run_summary: pd.DataFrame, mode: str) -> pd.DataFrame:
         raise ValueError(f"Unknown dedupe mode: {mode}")
 
     keys = ["layer", "lr_row", "lr_col", "seed"]
-    return run_summary.groupby(keys, dropna=False, as_index=False).apply(
-        pick, include_groups=False
-    ).reset_index(drop=True)
+    return (
+        run_summary.groupby(keys, dropna=False, as_index=False)
+        .apply(pick, include_groups=False)
+        .reset_index(drop=True)
+    )
 
 
 def summarize_configs(run_summary: pd.DataFrame) -> pd.DataFrame:
@@ -278,7 +296,9 @@ def plot_outcomes(cfg: pd.DataFrame, outdir: Path) -> None:
     plt.close(fig)
 
 
-def plot_time_to_target(run_summary: pd.DataFrame, cfg: pd.DataFrame, outdir: Path) -> None:
+def plot_time_to_target(
+    run_summary: pd.DataFrame, cfg: pd.DataFrame, outdir: Path
+) -> None:
     labels = cfg["config"].tolist()
     x = np.arange(len(labels))
     fig, ax = plt.subplots(figsize=(max(10, len(labels) * 1.8), 5.0))
@@ -349,7 +369,9 @@ def plot_time_to_target(run_summary: pd.DataFrame, cfg: pd.DataFrame, outdir: Pa
     plt.close(fig)
 
 
-def plot_auroc_curves(df: pd.DataFrame, run_summary: pd.DataFrame, outdir: Path) -> None:
+def plot_auroc_curves(
+    df: pd.DataFrame, run_summary: pd.DataFrame, outdir: Path
+) -> None:
     configs = run_summary["config"].drop_duplicates().tolist()
     n = len(configs)
     ncols = 2
@@ -431,12 +453,7 @@ def plot_sigreg_terms(df: pd.DataFrame, outdir: Path) -> None:
             continue
         rows = sig[sig[metric].notna()]
         for config, gr in rows.groupby("config"):
-            mean = (
-                gr.groupby("_step")[metric]
-                .mean()
-                .reset_index()
-                .sort_values("_step")
-            )
+            mean = gr.groupby("_step")[metric].mean().reset_index().sort_values("_step")
             ax.plot(mean["_step"], mean[metric], linewidth=1.6, label=config)
         ax.set_title(title)
         ax.set_xlabel("step")
@@ -462,7 +479,9 @@ def plot_group_stats(df: pd.DataFrame, outdir: Path) -> None:
     metrics = [(metric, title) for metric, title in metrics if metric in df.columns]
     if not metrics:
         fig, ax = plt.subplots(figsize=(8, 2.5))
-        ax.text(0.5, 0.5, "No SIGReg group-stat columns found", ha="center", va="center")
+        ax.text(
+            0.5, 0.5, "No SIGReg group-stat columns found", ha="center", va="center"
+        )
         ax.axis("off")
         fig.tight_layout()
         fig.savefig(outdir / "group_stats_by_step.png", dpi=180)
@@ -474,12 +493,7 @@ def plot_group_stats(df: pd.DataFrame, outdir: Path) -> None:
     for ax, (metric, title) in zip(axes, metrics):
         rows = df[df[metric].notna()]
         for config, gr in rows.groupby("config"):
-            mean = (
-                gr.groupby("_step")[metric]
-                .mean()
-                .reset_index()
-                .sort_values("_step")
-            )
+            mean = gr.groupby("_step")[metric].mean().reset_index().sort_values("_step")
             ax.plot(mean["_step"], mean[metric], linewidth=1.6, label=config)
         ax.set_title(title)
         ax.set_xlabel("step")
@@ -502,7 +516,9 @@ def plot_heatmaps(cfg: pd.DataFrame, outdir: Path) -> None:
         mat = np.full((len(rows), len(cols)), np.nan)
         for i, lr_row in enumerate(rows):
             for j, lr_col in enumerate(cols):
-                hit = layer0[(layer0["lr_row"] == lr_row) & (layer0["lr_col"] == lr_col)]
+                hit = layer0[
+                    (layer0["lr_row"] == lr_row) & (layer0["lr_col"] == lr_col)
+                ]
                 if len(hit):
                     mat[i, j] = hit.iloc[0][metric]
         return mat
@@ -525,7 +541,14 @@ def plot_heatmaps(cfg: pd.DataFrame, outdir: Path) -> None:
         for i in range(len(rows)):
             for j in range(len(cols)):
                 if not np.isnan(mat[i, j]):
-                    ax.text(j, i, f"{mat[i, j]:.3f}", ha="center", va="center", color="white")
+                    ax.text(
+                        j,
+                        i,
+                        f"{mat[i, j]:.3f}",
+                        ha="center",
+                        va="center",
+                        color="white",
+                    )
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         if threshold is not None:
             im.set_clim(min(np.nanmin(mat), threshold), max(np.nanmax(mat), threshold))

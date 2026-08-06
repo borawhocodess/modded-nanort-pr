@@ -1,6 +1,9 @@
 import os
+import platform
 import random
+import subprocess
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -14,18 +17,83 @@ from torch.nn.utils import clip_grads_with_norm_, get_total_norm
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from dataclasses import asdict
-
-from rt.config import TrainConfig
+from rt.config import OFFICIAL_TARGET_AUROC, TrainConfig
 from rt.data import RelationalDataset, get_column_index
 from rt.model import RelationalTransformer
 from rt.optim import Muon, build_muon_param_groups
-from rt.val_metrics import decompose_val_auroc, eval_is_due
+from rt.val_metrics import decompose_val_auroc, eval_is_due, safe_auroc
+
+
+def _git_value(*args: str) -> str | None:
+    """Return a small Git provenance field, or ``None`` outside a checkout."""
+    result = subprocess.run(
+        ["git", *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    value = result.stdout.strip()
+    return value if result.returncode == 0 and value else None
+
+
+def _reproducibility_metadata(device: str) -> dict[str, str | float | bool | None]:
+    commit = _git_value("rev-parse", "HEAD")
+    status = _git_value("status", "--porcelain")
+    return {
+        "official_target_auroc": OFFICIAL_TARGET_AUROC,
+        "artifact_repo": os.environ.get("NANORT_ARTIFACT_REPO"),
+        "artifact_revision": os.environ.get("NANORT_ARTIFACT_REVISION"),
+        "git_commit": commit,
+        "git_dirty": None if commit is None else status is not None,
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "gpu": torch.cuda.get_device_name(device),
+    }
+
+
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the raw module behind DDP and/or ``torch.compile`` wrappers."""
+    while True:
+        if isinstance(model, DDP):
+            model = model.module
+        elif hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        else:
+            return model
+
+
+def _canonical_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Checkpoint without wrapper-specific ``module.``/``_orig_mod.`` prefixes."""
+    return _unwrap_model(model).state_dict()
+
+
+def _load_model_state(model: torch.nn.Module, path: Path) -> None:
+    """Load current or historical raw/compiled/DDP nanoRT checkpoints."""
+    state_dict = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(state_dict, dict):
+        raise TypeError(
+            f"Expected a state_dict mapping in {path}, got {type(state_dict)}"
+        )
+
+    canonical = {}
+    for name, value in state_dict.items():
+        clean = name
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ("module.", "_orig_mod."):
+                if clean.startswith(prefix):
+                    clean = clean[len(prefix) :]
+                    changed = True
+        canonical[clean] = value
+    model.load_state_dict(canonical)
 
 
 # NanoRT: 45-minute wall-clock training timer ──────────────────────────────────
 class TrainTimer:
-    """Counts active training time, starting from the first training step."""
+    """Count historical timed wall-clock after the first optimizer update."""
 
     def __init__(self, budget_minutes: float):
         self.budget_secs = budget_minutes * 60.0
@@ -53,7 +121,7 @@ class ValAUROCCallback:
     Only runs on rank 0 — not DDP-safe, fine for the 1×H200 setup.
     """
 
-    TARGET_AUROC = 0.81621
+    TARGET_AUROC = OFFICIAL_TARGET_AUROC
 
     def __init__(
         self,
@@ -88,7 +156,7 @@ class ValAUROCCallback:
             val_dataset,
             batch_size=None,
             num_workers=num_workers,
-            persistent_workers=True,
+            persistent_workers=num_workers > 0,
             pin_memory=True,
             in_order=True,
         )
@@ -96,11 +164,16 @@ class ValAUROCCallback:
         # Each val sequence has exactly one target cell, and its col_name_idxs
         # entry is the text index of the target column — the same index
         # get_column_index resolves — so the batch already carries the task id.
-        self.task_names = {
-            get_column_index(target_column, table_name, db_name):
-                f"{table_name}/{target_column}"
+        task_pairs = [
+            (
+                get_column_index(target_column, table_name, db_name),
+                f"{table_name}/{target_column}",
+            )
             for db_name, table_name, target_column, _split, _drop in val_tasks
-        }
+        ]
+        self.task_names = dict(task_pairs)
+        if len(self.task_names) != len(task_pairs):
+            raise ValueError(f"Validation task IDs are not unique: {task_pairs}")
         self.device = device
         self.eval_every = eval_every
         self.timer = timer
@@ -119,6 +192,7 @@ class ValAUROCCallback:
         # decays, so the budget-end checkpoint is NOT the best one to keep.
         self.save_ckpt_dir = save_ckpt_dir
         self.best_auroc = -float("inf")
+        self.eval_seconds_total = 0.0
 
     def _due(self, step: int) -> bool:
         return eval_is_due(
@@ -133,8 +207,9 @@ class ValAUROCCallback:
         if not self._due(step):
             return
 
+        eval_started = time.perf_counter()
         net.eval()
-        preds, labels, task_ids, losses = [], [], [], []
+        preds, labels, task_ids, weighted_losses = [], [], [], []
         stats_accum = {}
         stats_count = 0
         with torch.inference_mode():
@@ -149,10 +224,8 @@ class ValAUROCCallback:
                 # need_stats defaults to True, which makes the model compute ~40
                 # diagnostics per batch — including .unique() calls — and
                 # _accumulate_stats then forces a GPU->CPU sync for every one of
-                # them. Over the full val loader that is thousands of syncs per
-                # eval, and an eval costs ~100 training steps. The stats are
-                # averaged over batches anyway, so take them from the first batch
-                # only: same diagnostic, a fraction of the syncs.
+                # them. Take a deterministic first-batch probe and label it as
+                # such; official metrics still use the complete validation set.
                 want_stats = stats_count == 0
                 loss, yhat_dict, _stats = net(batch, need_stats=want_stats)
                 if want_stats:
@@ -161,7 +234,7 @@ class ValAUROCCallback:
                 yhat = yhat_dict["boolean"][batch["is_targets"]]
                 y = batch["boolean_values"][batch["is_targets"]].flatten()
 
-                losses.append(loss.item())
+                weighted_losses.append((loss.item(), y.numel()))
                 preds.append(yhat.flatten())
                 labels.append(y)
                 task_ids.append(batch["col_name_idxs"][batch["is_targets"]])
@@ -171,14 +244,18 @@ class ValAUROCCallback:
         labels_bin = [int(x > 0) for x in labels_np]
         task_ids_np = torch.cat(task_ids).cpu().numpy()
 
-        auroc = roc_auc_score(labels_bin, preds_np)
-        mtp_loss = sum(losses) / len(losses)
+        auroc = safe_auroc(labels_bin, preds_np)
+        n_loss_examples = sum(n for _, n in weighted_losses)
+        mtp_loss = sum(value * n for value, n in weighted_losses) / max(
+            n_loss_examples, 1
+        )
 
         # auroc_zero_shot pools all val tasks into one number and is kept as-is:
         # it is what the record history and time_to_target are measured against.
         # The decomposition next to it says how much of it is base-rate
         # separation between tasks rather than within-task signal.
         log = {
+            "val/auroc_pooled": auroc,
             "val/auroc_zero_shot": auroc,
             "val/mtp_loss": mtp_loss,
             "val/score_db": float("nan"),
@@ -186,7 +263,15 @@ class ValAUROCCallback:
         log.update(
             decompose_val_auroc(preds_np, labels_bin, task_ids_np, self.task_names)
         )
-        log.update(_mean_stats(stats_accum, stats_count, prefix="val/"))
+        log.update(_mean_stats(stats_accum, stats_count, prefix="val_probe/"))
+
+        eval_seconds = time.perf_counter() - eval_started
+        if step == 0:
+            log["timing/init_eval_seconds"] = eval_seconds
+        else:
+            self.eval_seconds_total += eval_seconds
+            log["timing/val_eval_seconds"] = eval_seconds
+            log["timing/val_eval_seconds_total"] = self.eval_seconds_total
 
         # Step 0 is the zero-gradient baseline: it must never set time_to_target
         # (the timer has not even started, so it would read ~0s and the metric
@@ -215,19 +300,22 @@ class ValAUROCCallback:
                 f"time_to_target={self._time_to_target:.1f}s ***"
             )
 
-        if self.save_ckpt_dir is not None and auroc > self.best_auroc:
+        # Step 0 is a scientific control only: it cannot select a checkpoint.
+        if step > 0 and self.save_ckpt_dir is not None and auroc > self.best_auroc:
             self.best_auroc = auroc
             ckpt_dir = Path(self.save_ckpt_dir).expanduser()
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(net.state_dict(), ckpt_dir / "best.pt")
-            print(f"\n[ckpt] new best auroc={auroc:.4f} @ step={step} -> {ckpt_dir}/best.pt")
+            torch.save(_canonical_state_dict(net), ckpt_dir / "best.pt")
+            print(
+                f"\n[ckpt] new best auroc={auroc:.4f} @ step={step} -> {ckpt_dir}/best.pt"
+            )
 
         wandb.log(log, step=step)
         per_task = "  ".join(
             f"{name}={log[f'val/auroc/{name}']:.4f}"
             f"(p={log[f'val/base_rate/{name}']:.3f})"
             for name in sorted(
-                k[len("val/auroc/"):] for k in log if k.startswith("val/auroc/")
+                k[len("val/auroc/") :] for k in log if k.startswith("val/auroc/")
             )
         )
         print(
@@ -235,8 +323,9 @@ class ValAUROCCallback:
             f"  mean_per_task={log['val/auroc_mean_per_task']:.4f}"
             f"  between={log['val/auroc_between']:.4f}"
             f"  cross_weight={log['val/pooled_cross_weight']:.3f}"
-            f"  tie_frac={log['val/pred_tie_frac']:.3f}"
+            f"  pos_neg_tie_rate={log['val/pred_pos_neg_tie_rate']:.3f}"
             f"  val/mtp_loss={mtp_loss:.4f}"
+            f"  eval_seconds={eval_seconds:.1f}"
             f"\n          {per_task}"
         )
         net.train()
@@ -308,6 +397,7 @@ def _mean_stats(accum: dict[str, float], count: int, prefix: str = "") -> dict:
 
 
 def main(cfg: TrainConfig):
+    cfg.validate()
     # Single config object (rt/config.py) is the only entry point — no CLI.
     # Unpacked into locals here so the body below reads with bare names.
     project = cfg.project
@@ -380,7 +470,8 @@ def main(cfg: TrainConfig):
         world_size = 1
 
     if rank == 0:
-        run = wandb.init(project=project, config=asdict(cfg), tags=["nanort"])
+        run_config = {**asdict(cfg), **_reproducibility_metadata(device)}
+        run = wandb.init(project=project, config=run_config, tags=["nanort"])
         print(run.name)
 
     # NanoRT: initialise 45-minute training timer
@@ -457,20 +548,10 @@ def main(cfg: TrainConfig):
                 eval_dataset,
                 batch_size=None,
                 num_workers=num_workers,
-                persistent_workers=True,
+                persistent_workers=num_workers > 0,
                 pin_memory=True,
                 in_order=True,
             )
-
-    # SIGReg validation (mirrors the SigReg record run).
-    if sigreg_layer is not None and sigreg_layer < 0:
-        sigreg_layer = None
-    if sigreg_lambda_row < 0.0 or sigreg_lambda_col < 0.0:
-        raise ValueError("SIGReg lambdas must be non-negative")
-    if sigreg_lambda_row + sigreg_lambda_col >= 1.0:
-        raise ValueError("SIGReg lambdas must sum to less than 1.0")
-    if sigreg_lr is not None and sigreg_lr <= 0.0:
-        sigreg_lr = None
 
     net = RelationalTransformer(
         num_blocks=num_blocks,
@@ -496,8 +577,7 @@ def main(cfg: TrainConfig):
     )
     if load_ckpt_path is not None:
         load_ckpt_path = Path(load_ckpt_path).expanduser()
-        state_dict = torch.load(load_ckpt_path, map_location="cpu")
-        net.load_state_dict(state_dict)
+        _load_model_state(net, load_ckpt_path)
 
     net = net.to(device)
     net = net.to(torch.bfloat16)
@@ -517,8 +597,8 @@ def main(cfg: TrainConfig):
             adamw_count = sum(p.numel() for p in adamw_params)
             total = muon_count + adamw_count
             print(
-                f"param_groups: muon={muon_count:_} ({100*muon_count/total:.1f}%)"
-                f"  adamw={adamw_count:_} ({100*adamw_count/total:.1f}%)"
+                f"param_groups: muon={muon_count:_} ({100 * muon_count / total:.1f}%)"
+                f"  adamw={adamw_count:_} ({100 * adamw_count / total:.1f}%)"
                 f"  total={total:_}"
             )
         opt_muon = Muon(muon_params, lr=muon_lr)
@@ -681,9 +761,17 @@ def main(cfg: TrainConfig):
                     elif task_type == "reg":
                         yhat = yhat_dict["number"][batch["is_targets"]]
                         y = batch["number_values"][batch["is_targets"]].flatten()
+                    else:
+                        raise ValueError(
+                            f"Unsupported evaluation task type: {task_type}"
+                        )
 
-                    assert yhat.size(0) == true_batch_size
-                    assert y.size(0) == true_batch_size
+                    if yhat.size(0) != true_batch_size or y.size(0) != true_batch_size:
+                        raise RuntimeError(
+                            "Evaluation target count does not match true_batch_size: "
+                            f"predictions={yhat.size(0)}, labels={y.size(0)}, "
+                            f"expected={true_batch_size}."
+                        )
 
                     pred = yhat.flatten()
 
@@ -743,7 +831,7 @@ def main(cfg: TrainConfig):
         return metrics
 
     def checkpoint(best=False, db_name="", table_name=""):
-        if rank != 0:
+        if rank != 0 or save_ckpt_dir is None:
             return
         save_ckpt_dir_ = Path(save_ckpt_dir).expanduser()
         save_ckpt_dir_.mkdir(parents=True, exist_ok=True)
@@ -752,8 +840,7 @@ def main(cfg: TrainConfig):
         else:
             save_ckpt_path = f"{save_ckpt_dir_}/{steps=}.pt"
 
-        state_dict = net.module.state_dict() if ddp else net.state_dict()
-        torch.save(state_dict, save_ckpt_path)
+        torch.save(_canonical_state_dict(net), save_ckpt_path)
         print(f"saved checkpoint to {save_ckpt_path}")
 
     def opt_zero_grad():
@@ -781,8 +868,8 @@ def main(cfg: TrainConfig):
 
     pbar = tqdm(total=max_steps, desc="steps", disable=rank != 0)
 
-    best_val_metrics = dict()
-    best_test_metrics = dict()
+    best_val_metrics = {}
+    best_test_metrics = {}
     done = False
 
     while steps < max_steps and not done:
@@ -803,7 +890,9 @@ def main(cfg: TrainConfig):
                             best_test_metrics[(db_name, table_name)] = metrics["test"][
                                 (db_name, table_name)
                             ]
-                            checkpoint(best=True, db_name=db_name, table_name=table_name)
+                            checkpoint(
+                                best=True, db_name=db_name, table_name=table_name
+                            )
                         else:
                             checkpoint()
 
@@ -905,15 +994,15 @@ def main(cfg: TrainConfig):
                 # Log simplicial attention stats early, then periodically.
                 if train_stats and (steps <= 5 or steps % 10 == 0):
                     flat_train_stats = {
-                        f"train/{k}": _stat_to_float(v)
-                        for k, v in train_stats.items()
+                        f"train/{k}": _stat_to_float(v) for k, v in train_stats.items()
                     }
                     log.update(flat_train_stats)
                     # simplicial/* keys are absent when the simplicial path is
                     # disabled (simplicial_layers=none) — guard so that control
                     # run doesn't KeyError at the first log step.
-                    if (steps <= 5 or steps % 50 == 0) and \
-                            "train/simplicial/edge_count" in flat_train_stats:
+                    if (
+                        steps <= 5 or steps % 50 == 0
+                    ) and "train/simplicial/edge_count" in flat_train_stats:
                         print(
                             f"\nstep={steps}  "
                             f"train/simplicial/edge_count="
@@ -957,9 +1046,5 @@ def main(cfg: TrainConfig):
 
     if ddp:
         dist.destroy_process_group()
-
-
-if __name__ == "__main__":
-    import strictfire
-
-    strictfire.StrictFire(main)
+    if rank == 0:
+        wandb.finish()

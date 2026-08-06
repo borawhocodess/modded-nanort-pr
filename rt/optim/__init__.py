@@ -1,5 +1,6 @@
-from .muon import Muon
+from .muon import Muon as Muon
 
+__all__ = ["MUON_BLOCK_MODULES", "Muon", "build_muon_param_groups"]
 
 MUON_BLOCK_MODULES = ("attns", "nbr_attn", "rel_attn", "ffn")
 
@@ -27,9 +28,7 @@ def build_muon_param_groups(model) -> tuple[list, list]:
             continue
         parts = name.split(".")
         in_block = parts[0] == "blocks" and len(parts) >= 2
-        in_muon_module = (
-            in_block and len(parts) >= 3 and parts[2] in MUON_BLOCK_MODULES
-        )
+        in_muon_module = in_block and len(parts) >= 3 and parts[2] in MUON_BLOCK_MODULES
         is_weight_2d = param.ndim == 2
 
         if in_muon_module and is_weight_2d:

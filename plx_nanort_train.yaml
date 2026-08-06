@@ -2,8 +2,8 @@ version: 1.1
 kind: component
 name: nanort-train
 description: >
-  NanoRT training run com Muon optimizer: pretrain RT for 45 minutes on 1xH200,
-  leaving one database held out, and log zero-shot AUROC on the fixed val artifact.
+  Reproduce nanoRT record #4 (309 s): Muon + column SIGReg + static
+  relation-conditioned trilinear neighbor attention on 1xH200.
 queue: nebius/default
 inputs:
   - name: holdout_db
@@ -19,6 +19,13 @@ inputs:
       Example: "franciscogaluppo/nanort-artifacts"
     type: str
     isOptional: false
+  - name: hf_artifacts_revision
+    description: >
+      HuggingFace branch, tag, or immutable commit for the artifacts. The job
+      resolves this to a commit and records it in the W&B config.
+    type: str
+    isOptional: true
+    value: main
   - name: wandb_project
     description: W&B project name.
     type: str
@@ -80,7 +87,7 @@ inputs:
       preserve a strong step-1 init before the schedule ramps up.
     type: int
     isOptional: true
-    value: 200
+    value: 3000
   - name: simplicial_layers
     description: >
       Block indices with simplicial attention: "all", "none" or e.g. "0,4,8".
@@ -90,11 +97,11 @@ inputs:
     value: all
   - name: update_relations
     description: >
-      "1" (default) = dynamic relation stream (RelAttn updates r each block);
-      "0" = static relation operators (HGT-style), r keeps its frozen init r^(0).
+      "0" (record default) = static relation operators, preserving the
+      text-derived relation stream; "1" enables RelAttn updates between blocks.
     type: str
     isOptional: true
-    value: "1"
+    value: "0"
   - name: qk_norm
     description: >
       "1" (default) = per-head RMSNorm on the trilinear score factors
@@ -113,21 +120,21 @@ inputs:
     value: 1.0
   - name: sigreg_layer
     description: >
-      Block index whose cell hidden state is SIGReg-regularized. -1 (default)
-      disables SIGReg, leaving the simplicial-only run.
+      Block index whose cell hidden state is SIGReg-regularized. Record default
+      is layer 0; -1 disables SIGReg for ablations.
     type: int
     isOptional: true
-    value: -1
+    value: 0
   - name: sigreg_lambda_row
     description: SIGReg row-view loss coefficient (0 = off).
     type: float
     isOptional: true
     value: 0.0
   - name: sigreg_lambda_col
-    description: SIGReg column-view loss coefficient (0 = off; record used col).
+    description: SIGReg column-view loss coefficient (record default 0.001).
     type: float
     isOptional: true
-    value: 0.0
+    value: 0.001
   - name: sigreg_n_proj
     description: Number of random projections used by SIGReg.
     type: int
@@ -165,11 +172,11 @@ inputs:
     value: nanort-simplicial-staticrel
   - name: eval_at_step1
     description: >
-      "1" (default) evaluates val auroc at step 1. Set "0" to skip it so
-      time_to_target reflects a real trained checkpoint, not the near-init spike.
+      Record default "0" skips the near-initialization eval; "1" enables it for
+      diagnostics. The first eligible record eval is step 100 by default.
     type: str
     isOptional: true
-    value: "1"
+    value: "0"
   - name: eval_at_step0
     description: >
       "1" (default) evaluates val auroc at step 0 — before any optimizer step —
@@ -259,13 +266,33 @@ run:
         fi
         set -x
 
+        log_step "Resolving immutable artifact revision"
+        HF_ARTIFACTS_REPO="{{ hf_artifacts_repo }}"
+        HF_ARTIFACTS_REVISION_REQUESTED="{{ hf_artifacts_revision }}"
+        HF_ARTIFACTS_REVISION="$(
+          pixi run python - "$HF_ARTIFACTS_REPO" "$HF_ARTIFACTS_REVISION_REQUESTED" <<'PY'
+        import sys
+
+        from huggingface_hub import HfApi
+
+        repo_id, revision = sys.argv[1:]
+        print(HfApi().repo_info(repo_id=repo_id, repo_type="dataset", revision=revision).sha)
+        PY
+        )"
+        export NANORT_ARTIFACT_REPO="$HF_ARTIFACTS_REPO"
+        export NANORT_ARTIFACT_REVISION="$HF_ARTIFACTS_REVISION"
+        echo "artifact=$NANORT_ARTIFACT_REPO@$NANORT_ARTIFACT_REVISION"
+
         log_step "Downloading ra-holdout-{{ holdout_db }} artifacts"
-        hf download {{ hf_artifacts_repo }} --repo-type dataset --include "ra-holdout-{{ holdout_db }}/train/*" --local-dir ~/scratch/nanort_artifacts
-        hf download {{ hf_artifacts_repo }} --repo-type dataset --include "ra-holdout-{{ holdout_db }}/val/*" --local-dir ~/scratch/nanort_artifacts
-        for DB in $(ls ~/scratch/nanort_artifacts/ra-holdout-{{ holdout_db }}/train/); do
-          ln -sfn ~/scratch/nanort_artifacts/ra-holdout-{{ holdout_db }}/train/$DB ~/scratch/pre/$DB
+        hf download "$HF_ARTIFACTS_REPO" --repo-type dataset --revision "$HF_ARTIFACTS_REVISION" --include "ra-holdout-{{ holdout_db }}/train/*" --local-dir ~/scratch/nanort_artifacts
+        hf download "$HF_ARTIFACTS_REPO" --repo-type dataset --revision "$HF_ARTIFACTS_REVISION" --include "ra-holdout-{{ holdout_db }}/val/*" --local-dir ~/scratch/nanort_artifacts
+        TRAIN_ROOT="$HOME/scratch/nanort_artifacts/ra-holdout-{{ holdout_db }}/train"
+        for DB_DIR in "$TRAIN_ROOT"/*; do
+          [ -d "$DB_DIR" ] || continue
+          DB="$(basename "$DB_DIR")"
+          ln -sfn "$DB_DIR" "$HOME/scratch/pre/$DB"
         done
-        ln -sfn ~/scratch/nanort_artifacts/ra-holdout-{{ holdout_db }}/val/{{ holdout_db }} ~/scratch/pre/{{ holdout_db }}
+        ln -sfn "$HOME/scratch/nanort_artifacts/ra-holdout-{{ holdout_db }}/val/{{ holdout_db }}" "$HOME/scratch/pre/{{ holdout_db }}"
 
         log_step "Checking relation-aware artifacts"
         pixi run python -u - <<'PY'
@@ -295,9 +322,10 @@ run:
                     "Build/upload relation-aware holdout artifacts before "
                     "running the 45-minute training YAML."
                 )
-            rels = json.load(open(path / "relation_text_idxs.json"))
+            with (path / "relation_text_idxs.json").open() as stream:
+                rels = json.load(stream)
             if not rels:
-                raise AssertionError(f"{path}/relation_text_idxs.json is empty")
+                raise ValueError(f"{path}/relation_text_idxs.json is empty")
             print(
                 f"[artifact-check] {artifact_db}: relation_types={len(rels)} "
                 f"text_emb_size={(path / 'text_emb_all-MiniLM-L12-v2.bin').stat().st_size}",
@@ -313,23 +341,33 @@ run:
         log_step "Running holdout training (holdout={{ holdout_db }}, optimizer={{ optimizer }}, max_steps={{ max_steps }}, budget={{ time_budget_minutes }}min)"
         pixi run python -u scripts/nanort_train.py
 
-        if [ -n "{{ hf_checkpoint_repo }}" ]; then
-          log_step "Uploading best checkpoint to HF ({{ hf_checkpoint_repo }}:$HF_CKPT_PATH)"
+        HF_CHECKPOINT_REPO="{{ hf_checkpoint_repo }}"
+        if [ -n "$HF_CHECKPOINT_REPO" ]; then
+          log_step "Uploading best checkpoint to HF ($HF_CHECKPOINT_REPO:$HF_CKPT_PATH)"
           cat > "$CKPT_DIR/metadata.json" <<EOF
         {
           "holdout_db": "{{ holdout_db }}",
           "optimizer": "{{ optimizer }}",
           "muon_lr": {{ muon_lr }},
           "muon_warmup_steps": {{ muon_warmup_steps }},
+          "sigreg_layer": {{ sigreg_layer }},
+          "sigreg_lambda_row": {{ sigreg_lambda_row }},
+          "sigreg_lambda_col": {{ sigreg_lambda_col }},
           "update_relations": "{{ update_relations }}",
           "simplicial_layers": "{{ simplicial_layers }}",
+          "qk_norm": "{{ qk_norm }}",
+          "eval_at_step0": "{{ eval_at_step0 }}",
+          "eval_at_step1": "{{ eval_at_step1 }}",
+          "val_eval_freq": {{ val_eval_freq }},
+          "artifact_repo": "$NANORT_ARTIFACT_REPO",
+          "artifact_revision": "$NANORT_ARTIFACT_REVISION",
           "seed": {{ seed }},
           "hf_checkpoint_path": "$HF_CKPT_PATH"
         }
         EOF
           find "$CKPT_DIR" -maxdepth 2 -type f | sort | tee {{ globals.run_outputs_path }}/checkpoint_manifest.txt
           printf "%s\n" "$HF_CKPT_PATH" > {{ globals.run_outputs_path }}/hf_checkpoint_path.txt
-          hf upload {{ hf_checkpoint_repo }} "$CKPT_DIR" "$HF_CKPT_PATH" --repo-type {{ hf_checkpoint_repo_type }}
+          hf upload "$HF_CHECKPOINT_REPO" "$CKPT_DIR" "$HF_CKPT_PATH" --repo-type "{{ hf_checkpoint_repo_type }}"
         else
           log_step "hf_checkpoint_repo empty — skipping HF upload"
         fi

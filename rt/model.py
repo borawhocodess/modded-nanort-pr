@@ -19,6 +19,7 @@ flex_attention = torch.compile(flex_attention)
 # Standard building blocks
 # ---------------------------------------------------------------------------
 
+
 class MaskedAttention(nn.Module):
     def __init__(self, d_model, num_heads):
         super().__init__()
@@ -65,9 +66,18 @@ class FFN(nn.Module):
 # Transformer block
 # ---------------------------------------------------------------------------
 
+
 class RelationalBlock(nn.Module):
-    def __init__(self, d_model, num_heads, d_ff, use_simplicial=True,
-                 update_relations=True, qk_norm=True, layerscale_init=1.0):
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        d_ff,
+        use_simplicial=True,
+        update_relations=True,
+        qk_norm=True,
+        layerscale_init=1.0,
+    ):
         super().__init__()
 
         norm_names = ["feat", "col", "full", "ffn"]
@@ -107,7 +117,9 @@ class RelationalBlock(nn.Module):
             dx, nbr_entropy = self.nbr_attn(x_n, r_n, rel_batch, need_stats=need_stats)
             dx = dx * self.nbr_scale
             if self.update_relations:
-                dr, rel_entropy = self.rel_attn(r_n, x_n, rel_batch, need_stats=need_stats)
+                dr, rel_entropy = self.rel_attn(
+                    r_n, x_n, rel_batch, need_stats=need_stats
+                )
                 dr = dr * self.rel_scale
             else:
                 dr, rel_entropy = None, (x.new_zeros(()) if need_stats else None)
@@ -126,7 +138,9 @@ class RelationalBlock(nn.Module):
             if dr is not None:
                 r = r + dr
 
-        x = x + self.attns["full"](self.norms["full"](x), block_mask=block_masks["full"])
+        x = x + self.attns["full"](
+            self.norms["full"](x), block_mask=block_masks["full"]
+        )
         x = x + self.ffn(self.norms["ffn"](x))
 
         return x, r, block_stats
@@ -135,6 +149,7 @@ class RelationalBlock(nn.Module):
 # ---------------------------------------------------------------------------
 # Block mask helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_block_mask(mask, batch_size, seq_len, device):
     def _mod(b, h, q_idx, kv_idx):
@@ -155,10 +170,19 @@ def _make_block_mask(mask, batch_size, seq_len, device):
 # Full model
 # ---------------------------------------------------------------------------
 
+
 class RelationalTransformer(nn.Module):
     def __init__(
-        self, num_blocks, d_model, d_text, num_heads, d_ff, simplicial_layers=None,
-        update_relations=True, qk_norm=True, simplicial_layerscale_init=1.0,
+        self,
+        num_blocks,
+        d_model,
+        d_text,
+        num_heads,
+        d_ff,
+        simplicial_layers=None,
+        update_relations=True,
+        qk_norm=True,
+        simplicial_layerscale_init=1.0,
         # SIGReg: early-layer geometry regularization (None = disabled).
         sigreg_layer=None,
         sigreg_n_proj=64,
@@ -188,10 +212,19 @@ class RelationalTransformer(nn.Module):
         the lambdas in main.py gate whether the loss actually contributes."""
         super().__init__()
 
+        if d_model % num_heads:
+            raise ValueError(
+                f"d_model={d_model} must be divisible by num_heads={num_heads}"
+            )
+
         if simplicial_layers is None:
             simplicial_layers = range(num_blocks)
         simplicial_layers = set(simplicial_layers)
-        assert all(0 <= i < num_blocks for i in simplicial_layers), simplicial_layers
+        invalid_layers = sorted(i for i in simplicial_layers if not 0 <= i < num_blocks)
+        if invalid_layers:
+            raise ValueError(
+                f"simplicial layers out of range [0, {num_blocks}): {invalid_layers}"
+            )
         self.has_simplicial = len(simplicial_layers) > 0
         # The RelAttn of the LAST simplicial block gets no gradient: its dr
         # updates r, and no later block consumes that r (only x reaches the head,
@@ -201,40 +234,44 @@ class RelationalTransformer(nn.Module):
 
         self.enc_dict = nn.ModuleDict(
             {
-                "number":   nn.Linear(1,      d_model, bias=True),
-                "text":     nn.Linear(d_text, d_model, bias=True),
-                "datetime": nn.Linear(1,      d_model, bias=True),
+                "number": nn.Linear(1, d_model, bias=True),
+                "text": nn.Linear(d_text, d_model, bias=True),
+                "datetime": nn.Linear(1, d_model, bias=True),
                 "col_name": nn.Linear(d_text, d_model, bias=True),
-                "boolean":  nn.Linear(1,      d_model, bias=True),
+                "boolean": nn.Linear(1, d_model, bias=True),
                 "relation": nn.Linear(d_text, d_model, bias=True),
             }
         )
         self.dec_dict = nn.ModuleDict(
             {
-                "number":   nn.Linear(d_model, 1,      bias=True),
-                "text":     nn.Linear(d_model, d_text, bias=True),
-                "datetime": nn.Linear(d_model, 1,      bias=True),
-                "boolean":  nn.Linear(d_model, 1,      bias=True),
+                "number": nn.Linear(d_model, 1, bias=True),
+                "text": nn.Linear(d_model, d_text, bias=True),
+                "datetime": nn.Linear(d_model, 1, bias=True),
+                "boolean": nn.Linear(d_model, 1, bias=True),
             }
         )
         self.norm_dict = nn.ModuleDict(
             {
-                "number":   nn.RMSNorm(d_model),
-                "text":     nn.RMSNorm(d_model),
+                "number": nn.RMSNorm(d_model),
+                "text": nn.RMSNorm(d_model),
                 "datetime": nn.RMSNorm(d_model),
                 "col_name": nn.RMSNorm(d_model),
-                "boolean":  nn.RMSNorm(d_model),
+                "boolean": nn.RMSNorm(d_model),
                 "relation": nn.RMSNorm(d_model),
             }
         )
         self.mask_embs = nn.ParameterDict(
-            {t: nn.Parameter(torch.randn(d_model))
-             for t in ["number", "text", "datetime", "boolean"]}
+            {
+                t: nn.Parameter(torch.randn(d_model))
+                for t in ["number", "text", "datetime", "boolean"]
+            }
         )
         self.blocks = nn.ModuleList(
             [
                 RelationalBlock(
-                    d_model, num_heads, d_ff,
+                    d_model,
+                    num_heads,
+                    d_ff,
                     use_simplicial=(i in simplicial_layers),
                     update_relations=(update_relations and i != _last_simplicial),
                     qk_norm=qk_norm,
@@ -254,9 +291,10 @@ class RelationalTransformer(nn.Module):
         self.sigreg_use_row = sigreg_use_row
         self.sigreg_use_col = sigreg_use_col
         if sigreg_layer is not None:
-            assert 0 <= sigreg_layer < num_blocks, (
-                f"sigreg_layer={sigreg_layer} out of range for {num_blocks} blocks"
-            )
+            if not 0 <= sigreg_layer < num_blocks:
+                raise ValueError(
+                    f"sigreg_layer={sigreg_layer} out of range for {num_blocks} blocks"
+                )
             self.sigreg = SIGReg(
                 d_model,
                 n_proj=sigreg_n_proj,
@@ -277,35 +315,34 @@ class RelationalTransformer(nn.Module):
         return_embeddings: bool = False,
         need_stats: bool = True,
     ):
-        node_idxs      = batch["node_idxs"]
-        f2p_nbr_idxs   = batch["f2p_nbr_idxs"]
-        f2p_rel_idxs   = batch["f2p_rel_idxs"]
-        col_name_idxs  = batch["col_name_idxs"]
+        node_idxs = batch["node_idxs"]
+        f2p_nbr_idxs = batch["f2p_nbr_idxs"]
+        f2p_rel_idxs = batch["f2p_rel_idxs"]
+        col_name_idxs = batch["col_name_idxs"]
         table_name_idxs = batch["table_name_idxs"]
-        is_padding     = batch["is_padding"]
+        is_padding = batch["is_padding"]
         batch_size, seq_len = node_idxs.shape
         device = node_idxs.device
 
         # ── Attention masks ────────────────────────────────────────────────
-        pad      = (~is_padding[:, :, None]) & (~is_padding[:, None, :])
+        pad = (~is_padding[:, :, None]) & (~is_padding[:, None, :])
         same_node = node_idxs[:, :, None] == node_idxs[:, None, :]
         kv_in_f2p = (node_idxs[:, None, :, None] == f2p_nbr_idxs[:, :, None, :]).any(-1)
 
-        same_col_table = (
-            (col_name_idxs[:, :, None]  == col_name_idxs[:, None, :]) &
-            (table_name_idxs[:, :, None] == table_name_idxs[:, None, :])
+        same_col_table = (col_name_idxs[:, :, None] == col_name_idxs[:, None, :]) & (
+            table_name_idxs[:, :, None] == table_name_idxs[:, None, :]
         )
 
         attn_masks = {
             "feat": (same_node | kv_in_f2p) & pad,
-            "col":  same_col_table & pad,
+            "col": same_col_table & pad,
             "full": pad,
         }
-        for l in attn_masks:
-            attn_masks[l] = attn_masks[l].contiguous()
+        attn_masks = {name: mask.contiguous() for name, mask in attn_masks.items()}
 
-        make_bm = partial(_make_block_mask, batch_size=batch_size,
-                          seq_len=seq_len, device=device)
+        make_bm = partial(
+            _make_block_mask, batch_size=batch_size, seq_len=seq_len, device=device
+        )
         block_masks = {l: make_bm(m) for l, m in attn_masks.items()}
 
         # ── Edge list for simplicial attention (eager, outside compile) ───
@@ -313,12 +350,18 @@ class RelationalTransformer(nn.Module):
         rel_batch = None
         if self.has_simplicial:
             rel_batch = build_rel_batch(
-                f2p_nbr_idxs, f2p_rel_idxs, node_idxs, is_padding,
-                num_relations=num_relations, need_stats=need_stats,
+                f2p_nbr_idxs,
+                f2p_rel_idxs,
+                node_idxs,
+                is_padding,
+                num_relations=num_relations,
+                need_stats=need_stats,
             )
 
         # ── Relation stream init ───────────────────────────────────────────
-        r = self.norm_dict["relation"](self.enc_dict["relation"](batch["relation_embs"]))
+        r = self.norm_dict["relation"](
+            self.enc_dict["relation"](batch["relation_embs"])
+        )
         r_mask = batch["r_mask"]
         if r.dim() == 2:
             r = r.unsqueeze(0).expand(batch_size, -1, -1).clone()
@@ -331,7 +374,9 @@ class RelationalTransformer(nn.Module):
         # ── Cell stream init ───────────────────────────────────────────────
         x = 0
         x = x + (
-            self.norm_dict["col_name"](self.enc_dict["col_name"](batch["col_name_values"]))
+            self.norm_dict["col_name"](
+                self.enc_dict["col_name"](batch["col_name_values"])
+            )
             * (~is_padding)[..., None]
         )
         for i, t in enumerate(["number", "text", "datetime", "boolean"]):
@@ -411,11 +456,15 @@ class RelationalTransformer(nn.Module):
                 n_active_relation_types = rel_batch["r_t"].unique().numel()
                 n_active_relation_instances = rel_batch["seg_r"].unique().numel()
                 stats["simplicial/active_query_cells"] = float(n_active_q)
-                stats["simplicial/active_relation_types"] = float(n_active_relation_types)
+                stats["simplicial/active_relation_types"] = float(
+                    n_active_relation_types
+                )
                 stats["simplicial/active_relation_instances"] = float(
                     n_active_relation_instances
                 )
-                stats["simplicial/edges_per_q"] = float(rel_batch["T"]) / max(n_active_q, 1)
+                stats["simplicial/edges_per_q"] = float(rel_batch["T"]) / max(
+                    n_active_q, 1
+                )
                 stats["simplicial/triples_per_matched_fk_slot"] = float(
                     rel_batch["T"]
                 ) / max(matched_fk_slots, 1)
@@ -435,11 +484,11 @@ class RelationalTransformer(nn.Module):
         yhat_out = {t: None for t in ["number", "text", "datetime", "boolean"]}
 
         sem_types = batch["sem_types"]
-        masks     = batch["masks"].bool()
+        masks = batch["masks"].bool()
 
         for i, t in enumerate(["number", "text", "datetime", "boolean"]):
             yhat = self.dec_dict[t](x)
-            y    = batch[f"{t}_values"]
+            y = batch[f"{t}_values"]
             sem_type_mask = (sem_types == i) & masks
 
             if not sem_type_mask.any():
@@ -459,7 +508,7 @@ class RelationalTransformer(nn.Module):
             loss_out = loss_out + (loss_t * sem_type_mask).sum()
             yhat_out[t] = yhat
 
-        loss_out = loss_out / masks.sum()
+        loss_out = loss_out / masks.sum().clamp(min=1)
 
         # ── SIGReg auxiliary geometry losses (training-only) ────────────────
         # Row/col views are derived inside SIGReg from node_idxs and the packed
@@ -468,8 +517,13 @@ class RelationalTransformer(nn.Module):
         # always present so every caller can unpack the three-tuple.
         if self.sigreg is not None and self.training and sig_x is not None:
             sigreg_row, sigreg_col, sigreg_stats = self.sigreg(
-                sig_x, node_idxs, table_name_idxs, col_name_idxs, is_padding,
-                use_row=self.sigreg_use_row, use_col=self.sigreg_use_col,
+                sig_x,
+                node_idxs,
+                table_name_idxs,
+                col_name_idxs,
+                is_padding,
+                use_row=self.sigreg_use_row,
+                use_col=self.sigreg_use_col,
             )
         else:
             sigreg_row = x.new_zeros((), dtype=torch.float32)
@@ -478,9 +532,13 @@ class RelationalTransformer(nn.Module):
                 f"{view}/{key}": sigreg_row
                 for view in ("row", "col")
                 for key in (
-                    "groups_present", "groups_valid", "groups_valid_frac",
-                    "group_size_present_mean", "group_size_valid_mean",
-                    "group_size_valid_max", "cells_covered_frac",
+                    "groups_present",
+                    "groups_valid",
+                    "groups_valid_frac",
+                    "group_size_present_mean",
+                    "group_size_valid_mean",
+                    "group_size_valid_max",
+                    "cells_covered_frac",
                 )
             }
         stats["sigreg_row"] = sigreg_row

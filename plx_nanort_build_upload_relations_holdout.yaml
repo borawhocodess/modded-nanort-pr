@@ -8,8 +8,8 @@ description: >
   validates the artifact, and immediately checkpoints each validated database
   to HuggingFace so retries can resume from the last completed DB. After all
   databases are processed, uploads to HuggingFace in the holdout layout:
-    holdout-{DB}/val/{DB}/        ← that database's own relation-aware artifact
-    holdout-{HOLDOUT}/train/{DB}/ ← each of the 5 training databases
+    ra-holdout-{DB}/val/{DB}/        ← that database's relation-aware artifact
+    ra-holdout-{HOLDOUT}/train/{DB}/ ← each of the 5 training databases
   GPU (H200) required for text embedding. Expect 6–10 hours total.
 queue: nebius/default
 inputs:

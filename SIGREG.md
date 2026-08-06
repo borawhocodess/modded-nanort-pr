@@ -33,7 +33,7 @@ views da estrutura relacional que o modelo **já calcula**:
 | **row view** (features de um datapoint) | células com mesmo `node_idx` | `node_idxs` — parte da atenção `feat` |
 
 Cada view tem seu próprio *projection head* e a estatística SIGReg é avaliada
-**por grupo** e mediada sobre os grupos, fielmente ao §2.3–2.4 do paper.
+**por grupo** e agregada com peso proporcional ao número de células válidas.
 
 ---
 
@@ -111,13 +111,11 @@ projetada.
   **idêntico ao baseline**.
 - No `forward`: captura a saída do bloco `sigreg_layer`; computa SIGReg **apenas
   quando `self.training`** (no eval é pulado → **custo zero de inferência**);
-  retorna a 3-tupla `(loss, yhat_dict, {"row", "col", "embed"})`. `embed` é o
-  hidden state da camada (detached) para os diagnósticos de geometria.
+  retorna a 3-tupla `(loss, yhat_dict, stats)`. `stats` contém `sigreg_row`,
+  `sigreg_col` e os contadores `sigreg_{row,col}/...`; o hidden state não é
+  exposto nem armazenado pelo caminho de treino.
 
 ### `rt/main.py`
-- `geometry_diagnostics(...)` — calcula **effective rank** e **mean per-dim std**
-  em modo eager (fora do `torch.compile`, para não rodar `eigvalsh` dentro do
-  grafo).
 - **Ilha fp32**: após `net.to(torch.bfloat16)`, faz `net.sigreg.float()` (a
   quadratura da CF e o BatchNorm são numericamente sensíveis).
 - **Otimizador separado**: `opt_sigreg = AdamW(..., fused=False)` para o
@@ -130,9 +128,10 @@ projetada.
 - `build_muon_param_groups` ignora `sigreg.*` (tratado pelo otimizador separado).
 
 ### `scripts/nanort_train.py`
-- Flags CLI: `--sigreg-layer`, `--sigreg-lambda-row`, `--sigreg-lambda-col`,
-  `--sigreg-n-proj`, `--sigreg-lr`. `sigreg_layer < 0` ⇒ desabilitado (o
-  `plx_nanort_train.yaml` passa `-1` como default).
+- Configuração somente por variáveis `NANORT_SIGREG_*`, centralizada em
+  `TrainConfig.from_env()`. A receita do recorde usa layer 0, column view global
+  e `λ_col=1e-3`; para desabilitar, usar simultaneamente
+  `NANORT_SIGREG_LAYER=-1` e lambdas zero.
 
 ### `plx_nanort_train.yaml`
 - Inputs `sigreg_layer`, `sigreg_lambda_row`, `sigreg_lambda_col`,
@@ -147,36 +146,35 @@ projetada.
 | Métrica | Significado |
 |---|---|
 | `loss` | Perda supervisionada (MTP: Huber p/ number/datetime, BCE p/ boolean). É a tarefa em si. |
-| `loss_total` | Perda total efetivamente otimizada: `(1−λc−λr)·loss + λc·sigreg/col + λr·sigreg/row`. |
-| `loss/sup_weighted`, `loss/sigreg_row_weighted`, `loss/sigreg_col_weighted` | Termos ponderados da loss; use para ver se SIGReg domina ou fica inerte. |
-| `sigreg/row` | Estatística Epps–Pulley **projetada** da row view (por `node`). **Menor = embeddings da view mais próximos de N(0,1)**. É o sinal de treino do regularizador. |
-| `sigreg/col` | Idem para a column view (por `(table,col)`). |
-| `sigreg/{row,col}/groups_valid`, `groups_valid_frac` | Quantos grupos da view passam `min_group` e qual fração dos grupos presentes isso representa. |
-| `sigreg/{row,col}/group_size_valid_mean`, `group_size_valid_max` | Tamanho médio/máximo dos grupos que entram na estatística. |
-| `sigreg/{row,col}/cells_covered_frac` | Fração das células válidas coberta pelos grupos que passam `min_group`. |
 | `grad_norm`, `lr_muon`/`lr_adamw` (ou `lr`) | Já existentes. |
 
-**A cada `val_eval_freq` passos** (diagnóstico da geometria do *backbone* na
-camada regularizada — métricas-chave do paper, Fig. 1/6):
+**Nos steps de diagnóstico de treino** (1–5 e depois a cada 10 steps):
 
 | Métrica | Significado |
 |---|---|
-| `sigreg/effective_rank` | `exp(entropia de Shannon dos autovalores normalizados da covariância)`. **Alto = representação espalhada por muitas dimensões (isotrópica); baixo = colapsada**. SIGReg deve empurrá-lo **para cima**. É a métrica headline do paper. |
-| `sigreg/mean_dim_std` | Desvio-padrão médio por dimensão dos embeddings. **Maior = usa mais do espaço de embedding**; SIGReg empurra **para cima**. |
+| `train/sigreg_row` | Estatística Epps–Pulley projetada da row view (por `node`). Menor = projeções mais próximas de `N(0,1)`. |
+| `train/sigreg_col` | Idem para a column view (por `(table,col)`). |
+| `train/sigreg_{row,col}/groups_valid`, `groups_valid_frac` | Quantos grupos passam `min_group` e a fração dos grupos presentes. |
+| `train/sigreg_{row,col}/group_size_valid_mean`, `group_size_valid_max` | Tamanho médio/máximo dos grupos válidos. |
+| `train/sigreg_{row,col}/cells_covered_frac` | Fração das células válidas coberta pelos grupos aceitos. |
+
+`effective_rank` e `mean_dim_std` são análises desejáveis para o paper, mas **não
+são emitidas pela implementação atual**. Se adicionadas, devem rodar fora da
+região cronometrada ou ter seu custo contabilizado e ser testadas separadamente.
 
 **Métricas de avaliação (já existentes, são o que decide o speedrun):**
 
 | Métrica | Significado |
 |---|---|
-| `val/auroc_zero_shot` | AUROC zero-shot no artefato de val fixo (`rel-avito`). Alvo: **≥ 0.81621**. |
+| `val/auroc_pooled` (`val/auroc_zero_shot` legado) | AUROC pooled por instância no artefato de val fixo (`rel-avito`). Alvo: **≥ 0.81621**. |
 | `train/time_to_target` | Tempo (s) até atingir o alvo de AUROC. **A métrica que o speedrun otimiza** (−1 se não atingiu). |
 | `train/elapsed_seconds` | Tempo ativo de treino (budget de 45 min). |
 | `val/mtp_loss` | Perda MTP no val. |
 
 ### Como ler os experimentos
-- **SIGReg está atuando?** `sigreg/row` e `sigreg/col` devem cair ao longo do
-  treino, e `sigreg/effective_rank` / `sigreg/mean_dim_std` devem subir vs. o
-  baseline (`sigreg_layer=-1`).
+- **SIGReg está atuando?** `train/sigreg_row` e `train/sigreg_col` devem cair ao
+  longo do treino; comparar também cobertura e tamanho de grupos contra o
+  baseline explicitamente desabilitado.
 - **SIGReg ajuda o speedrun?** Compare `train/time_to_target` (e a curva
   `val/auroc_zero_shot`) contra o baseline. O paper prevê convergência mais
   rápida; confirme que o overhead por passo não anula o ganho.
@@ -190,8 +188,8 @@ camada regularizada — métricas-chave do paper, Fig. 1/6):
 
 - **fp32 / bf16**: o modelo roda bf16; o submódulo `sigreg` é mantido em fp32.
 - **torch.compile**: `dense_group_ids`/`index_add_` têm shapes fixos e devem
-  compilar; `self.training` cria 2 grafos (train/eval), dentro do
-  `cache_size_limit=16`. O `eigvalsh` dos diagnósticos roda **fora** do compile.
+  compilar; `self.training` cria grafos distintos de treino e eval, dentro do
+  `cache_size_limit=16`.
 - **Memória**: com `batch_size=256` e `n_proj=64`, o SIGReg materializa tensores
   `(B·S, K·17)` ≈ alguns GB. Se ocorrer OOM no H200, **reduza `sigreg_n_proj`**
   (ex.: 32) ou aumente `sigreg_min_group`.
@@ -227,7 +225,7 @@ polyaxon run -f plx_nanort_train.yaml -u \
   -P hf_token=$HF_TOKEN
 ```
 
-**Baseline (SIGReg desligado — `sigreg_layer=-1` é o default):**
+**Baseline (SIGReg explicitamente desligado):**
 
 ```bash
 polyaxon run -f plx_nanort_train.yaml -u \
@@ -235,6 +233,9 @@ polyaxon run -f plx_nanort_train.yaml -u \
   -P hf_artifacts_repo=gabrielveloso/nanort-artifacts \
   -P optimizer=muon \
   -P muon_lr=0.005 \
+  -P sigreg_layer=-1 \
+  -P sigreg_lambda_row=0 \
+  -P sigreg_lambda_col=0 \
   -P hf_token=$HF_TOKEN
 ```
 

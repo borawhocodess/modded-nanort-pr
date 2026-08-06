@@ -1,11 +1,11 @@
-"""Decomposition of the zero-shot val AUROC into interpretable parts.
+"""Diagnostics for nanoRT's official pooled instance-level validation AUROC.
 
-``rt.main`` reports ``val/auroc_zero_shot``: a single AUROC over the concatenated
-predictions of *all* rel-avito val tasks. That is not the metric the record
-targets — README ("Evaluation details") defines it as the **mean AUROC across the
-binary-classification tasks** — and the two diverge as soon as the tasks differ in
-base rate, which rel-avito's two val tasks do (``user-visits`` and ``user-clicks``,
-both on ``num_click``). This module computes what is needed to tell them apart.
+The speedrun intentionally computes one AUROC after concatenating the predictions
+from all eligible rel-avito validation tasks. This evaluates both within-task
+ranking and cross-task score alignment under the empirical example distribution.
+Because the tasks have different base rates, the two contributions can differ
+substantially. This module keeps the historical pooled score unchanged while
+making its exact within/cross-task decomposition auditable.
 
 Like ``rt.config``, it deliberately imports **no torch**, so it can be unit-tested
 without a GPU environment (``tests/test_val_metrics.py``).
@@ -79,7 +79,7 @@ def auroc_between_ceiling(counts: dict) -> float:
 
     # Positives of a higher-ranked task beat negatives of every lower-ranked one.
     num = sum(
-        p_i * sum(n_j for _, n_j in order[i + 1:]) for i, (p_i, _) in enumerate(order)
+        p_i * sum(n_j for _, n_j in order[i + 1 :]) for i, (p_i, _) in enumerate(order)
     )
     num += 0.5 * sum(p * n for p, n in order)  # within-task ties
     return num / (n_pos * n_neg)
@@ -95,9 +95,10 @@ def pooled_auroc_parts(preds, labels, task_ids) -> dict:
 
     with ``A_gh`` = P(a positive of task g scores above a negative of task h),
     ties counting 0.5. The ``g = h`` terms are the per-task AUROCs. The ``g ≠ h``
-    terms compare a positive of one task against a negative of *another* — a
-    comparison the benchmark never asks for, and precisely what a score that only
-    identifies the task exploits. Hence the identity, asserted by the unit test:
+    terms compare a positive of one task against a negative of another. Those
+    comparisons are part of the official global-ranking estimand and also expose
+    how much a predictor can gain from task-level score offsets. Hence the exact
+    identity asserted by the unit test:
 
         pooled = (1 - cross_weight)·pooled_within + cross_weight·pooled_cross
 
@@ -105,6 +106,9 @@ def pooled_auroc_parts(preds, labels, task_ids) -> dict:
     cross-task pairs. ``pooled_within`` weights the per-task AUROCs by n⁺_g·n⁻_g,
     so it differs from the unweighted ``auroc_mean_per_task``.
     """
+    preds = np.asarray(preds)
+    labels = np.asarray(labels)
+    task_ids = np.asarray(task_ids)
     tasks = np.unique(task_ids)
     pos = {t: np.sort(preds[(task_ids == t) & (labels == 1)]) for t in tasks}
     neg = {t: np.sort(preds[(task_ids == t) & (labels == 0)]) for t in tasks}
@@ -127,7 +131,7 @@ def pooled_auroc_parts(preds, labels, task_ids) -> dict:
             n = neg[h]
             if n.size == 0:
                 continue
-            lo = np.searchsorted(n, p, side="left")   # negatives strictly below
+            lo = np.searchsorted(n, p, side="left")  # negatives strictly below
             hi = np.searchsorted(n, p, side="right")  # ... and the tied ones
             u = float(lo.sum()) + 0.5 * float((hi - lo).sum())
             w = float(p.size * n.size)
@@ -144,28 +148,24 @@ def pooled_auroc_parts(preds, labels, task_ids) -> dict:
 
 
 def decompose_val_auroc(preds, labels_bin, task_ids, task_names) -> dict:
-    """Split the pooled val AUROC into its per-task and between-task parts.
+    """Split the official pooled AUROC into interpretable task-level parts.
 
-    ``val/auroc_zero_shot`` pools every val task into a single AUROC, but the
-    metric the record targets is the **mean across tasks**. The two diverge as
-    soon as the tasks have different base rates, and rel-avito's two val tasks do:
-    a predictor that merely tells ``user-visits`` targets from ``user-clicks``
-    targets already scores ``auroc_between`` in the pooled number while being
-    uninformative within either task. The target cell carries its column-name
-    embedding (see the cell-stream init in ``rt/model.py``) and the two tasks have
-    different column indices, so that separation is available from the input
-    alone, with no training at all.
+    The target cell carries its schema metadata, so task identity is legitimate
+    model input. ``auroc_task_prior_oracle`` quantifies the pooled score attainable
+    by an analytical score that is constant within each task and orders tasks by
+    their observed validation prevalence. It is an oracle diagnostic, not a
+    trainable baseline and never participates in record selection.
 
     Emits, per eval:
       ``auroc/<task>``, ``base_rate/<task>``, ``n_pos/<task>``, ``n_neg/<task>``
-      ``auroc_mean_per_task``  — the README metric
-      ``auroc_between``        — base-rate-only ceiling (see above)
+      ``auroc_mean_per_task``  — unweighted macro diagnostic
+      ``auroc_task_prior_oracle`` / ``auroc_between`` — task-prior oracle
       ``auroc_pooled_{within,cross}`` + ``pooled_cross_weight`` — exact split of
                                  the pooled number into same-task and cross-task
                                  pairs (see ``pooled_auroc_parts``)
-      ``pred_unique`` / ``pred_tie_frac`` — the whole net runs in bf16, so scores
-                                 carry ~3 decimal digits and ties are resolved as
-                                 0.5. This is the measurement noise floor.
+      ``pred_unique`` / ``pred_duplicate_fraction`` — score quantization
+      ``pred_pos_neg_tie_rate`` / ``pred_tie_frac`` — fraction of AUROC pairs
+                                 receiving half credit because scores tie
     """
     preds = np.asarray(preds)
     labels = np.asarray(labels_bin)
@@ -190,7 +190,10 @@ def decompose_val_auroc(preds, labels_bin, task_ids, task_names) -> dict:
     out["val/auroc_mean_per_task"] = (
         sum(per_task) / len(per_task) if per_task else float("nan")
     )
-    out["val/auroc_between"] = auroc_between_ceiling(counts)
+    task_prior_oracle = auroc_between_ceiling(counts)
+    out["val/auroc_task_prior_oracle"] = task_prior_oracle
+    # Backward-compatible name used by the initial audit runs.
+    out["val/auroc_between"] = task_prior_oracle
     out.update(pooled_auroc_parts(preds, labels, task_ids))
     out["val/n_tasks"] = float(len(counts))
     # >0 means the col_name_idxs -> task map missed: the per-task split is still
@@ -200,5 +203,24 @@ def decompose_val_auroc(preds, labels_bin, task_ids, task_names) -> dict:
     )
     n_unique = int(np.unique(preds).size)
     out["val/pred_unique"] = float(n_unique)
-    out["val/pred_tie_frac"] = 1.0 - n_unique / max(preds.size, 1)
+    out["val/pred_duplicate_fraction"] = 1.0 - n_unique / max(preds.size, 1)
+
+    pos_scores = preds[labels == 1]
+    neg_scores = preds[labels == 0]
+    if pos_scores.size and neg_scores.size:
+        pos_values, pos_counts = np.unique(pos_scores, return_counts=True)
+        neg_values, neg_counts = np.unique(neg_scores, return_counts=True)
+        _, pos_idx, neg_idx = np.intersect1d(
+            pos_values, neg_values, assume_unique=True, return_indices=True
+        )
+        tied_pairs = np.multiply(
+            pos_counts[pos_idx].astype(np.int64),
+            neg_counts[neg_idx].astype(np.int64),
+        ).sum()
+        tie_rate = float(tied_pairs) / float(pos_scores.size * neg_scores.size)
+    else:
+        tie_rate = float("nan")
+    out["val/pred_pos_neg_tie_rate"] = tie_rate
+    # Backward-compatible key; now defined by the AUROC-relevant pairwise rate.
+    out["val/pred_tie_frac"] = tie_rate
     return out
