@@ -65,7 +65,7 @@ def _simplicial_layers(name: str):
 
 @dataclass
 class TrainConfig:
-    """Training settings; default to the eight-block recipe."""
+    """Training settings; defaults reproduce the record recipe."""
 
     # run identity
     holdout_db: str = "rel-avito"

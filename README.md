@@ -13,7 +13,7 @@ the reference's **41m20s**, using:
 - **SIGReg** after the first block, with column grouping and weight `1e-3`.
 - **Typed trilinear attention**, with static foreign-key relation states.
 
-## Running
+## Running the current record
 
 Requirements: Linux x86-64, one NVIDIA H200, a CUDA 12.4-compatible driver,
 and [pixi](https://pixi.sh/).
@@ -30,15 +30,6 @@ default. Override [training settings](rt/config.py) through environment variable
 
 ```bash
 NANORT_SEED=1 ./run.sh
-```
-
-The default uses **8 transformer blocks**. In the [L40S depth comparison](docs/experiments/depth8-l40s.md),
-seed 0 reached the target in 308.3 s instead of 412.6 s with 12 blocks.
-The eight-block recipe still needs H200 timing. To use the archived record's
-12-block depth:
-
-```bash
-NANORT_NUM_BLOCKS=12 ./run.sh
 ```
 
 ## Record history
