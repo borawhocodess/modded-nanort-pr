@@ -65,7 +65,7 @@ def _simplicial_layers(name: str):
 
 @dataclass
 class TrainConfig:
-    """Training settings; defaults reproduce the record recipe."""
+    """Training settings; default to the eight-block recipe."""
 
     # run identity
     holdout_db: str = "rel-avito"
@@ -95,7 +95,7 @@ class TrainConfig:
     lr_total_steps: int | None = None  # OneCycle horizon; None → max_steps
 
     # model
-    num_blocks: int = 12
+    num_blocks: int = 8
     d_model: int = 256
     num_heads: int = 8
     d_ff: int = 1024
